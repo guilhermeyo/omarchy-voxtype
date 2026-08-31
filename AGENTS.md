@@ -46,6 +46,40 @@ case for someone without a GPU who has a friend with one. Note for C and D: the
 dictated text leaves this machine on every dictation. Say that out loud — do not
 let them find out later.
 
+**Q1b — Can this machine actually transcribe? Check, do not assume.**
+
+Ask this BEFORE anything else if the hardware sounds old, and run the check
+either way. It decides whether the rest of the install is even possible.
+
+```bash
+grep -o avx2 /proc/cpuinfo | head -1     # empty = no AVX2 = packaged binaries will not run
+voxtype info variants                     # read "Recommended for this hardware"
+```
+
+voxtype ships AVX2 and AVX-512 builds; the `native` variants are not installed.
+A pre-Haswell CPU (2013) has no AVX2 — a ThinkPad X220 and its generation cannot
+run them, and their integrated GPUs are too old for the Vulkan path. This is not
+a slow setup, it is one that does not start.
+
+If the machine cannot transcribe locally, do NOT walk them through downloading
+a Parakeet or Whisper model. Configure remote transcription instead:
+
+```toml
+[whisper]
+mode = "remote"
+remote_endpoint = "https://api.groq.com/openai/v1/audio/transcriptions"
+remote_model = "whisper-large-v3"
+```
+
+with the key in `VOXTYPE_WHISPER_API_KEY` rather than in the config file. Any
+OpenAI-compatible transcription endpoint works. Use `https` — voxtype warns that
+plain HTTP sends the raw audio unencrypted. `--engine soniox` (`SONIOX_API_KEY`)
+and `--engine cohere` are the two dedicated cloud engines if they prefer one.
+
+Tell them plainly what this means: their voice is uploaded on every dictation,
+and if they then pick a cloud polish stage in Q1, the text is uploaded again to
+a second vendor.
+
 **Q2 — What language will they dictate in?**
 
 This matters in three separate places and getting it wrong degrades the output

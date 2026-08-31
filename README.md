@@ -34,6 +34,48 @@ Prefer to do it yourself? `./install --dry-run` shows you every change first,
 then `./install` makes them. Or read [Install from scratch](#install-from-scratch)
 and do it by hand. Every path ends in the same place.
 
+## No hardware to transcribe with?
+
+Everything below assumes your machine can run the speech recognition itself.
+Plenty of machines cannot, and the failure is not "slow" — it is "does not
+start". The binaries voxtype ships are built for **AVX2 or AVX-512**
+(`voxtype-avx2`, `voxtype-onnx-avx2`, and the AVX-512 pair); the `native`
+variants are listed as *not installed*. A CPU older than Haswell (2013) has no
+AVX2, so a ThinkPad X220 or anything of that generation cannot run the packaged
+binaries at all, and its integrated GPU is too old for the Vulkan path.
+
+Check before you plan anything:
+
+```bash
+grep -o avx2 /proc/cpuinfo | head -1     # empty = no AVX2
+voxtype info variants                     # "Recommended for this hardware"
+```
+
+**voxtype can send the audio somewhere else.** This is a voxtype feature, not
+something this repo adds, and it means an old laptop only has to record and
+paste:
+
+```toml
+[whisper]
+mode = "remote"                                        # instead of "local"
+remote_endpoint = "https://api.groq.com/openai/v1/audio/transcriptions"
+remote_model = "whisper-large-v3"
+# remote_api_key = "..."   # better: export VOXTYPE_WHISPER_API_KEY instead
+```
+
+Any OpenAI-compatible transcription endpoint works — OpenAI, Groq, Together, or
+a `whisper.cpp` server on a machine you own. `remote_model` defaults to
+`whisper-1` if unset. **Use `https`**: voxtype warns that a plain-HTTP endpoint
+transmits your audio unencrypted, and that audio is your voice saying whatever
+you dictate. There are also two dedicated cloud engines, `--engine soniox`
+(`SONIOX_API_KEY`) and `--engine cohere`, each with its own config table.
+
+This composes with everything else here. Remote transcription plus the `gemini`
+polish stage is a complete setup that runs no model locally at all: the machine
+records audio, two APIs do the work, and the text is pasted where your cursor
+is. Latency is the network, and both hops see your dictation — which is the
+trade you are making for the hardware you have.
+
 ## Which setup do you want?
 
 This is the one decision that shapes everything else: **where the punctuation
