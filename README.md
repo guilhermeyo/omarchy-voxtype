@@ -30,9 +30,6 @@ model should run, what language you dictate in, whether you are on Omarchy, and
 where your key goes — then installs and verifies it. You do not have to read the
 rest of this document.
 
-This is a private repository. If `git clone` asks for credentials, you have not
-been given access to it yet — ask the owner to add you as a collaborator.
-
 Prefer to do it yourself? `./install --dry-run` shows you every change first,
 then `./install` makes them. Or read [Install from scratch](#install-from-scratch)
 and do it by hand. Every path ends in the same place.
