@@ -8,10 +8,13 @@
 // means FALLBACK OF THE PREVIOUS STEP: the step only runs when the step above
 // it failed (produced nothing usable).
 //
-//   sed+qwen+?gemini+sed  DEFAULT. sed, local LLM, cloud ONLY if the local one
-//                         went quiet, then sed AGAIN — the second pass catches
+//   sed+qwen              DEFAULT — this is DEFAULT_MODE below, and DEFAULT_SPEC
+//                         in bin/voxtype-punct. No cloud stage: see the comment
+//                         on DEFAULT_MODE for why the failure fallback may not
+//                         reach the network.
+//   sed+qwen+?gemini+sed  the `auto` alias plus a second sed pass, which catches
 //                         proper nouns (geminai/paracut) that the LLM faithfully
-//                         carried through from the transcript.
+//                         carried through from the transcript. Opt-in.
 //   sed+qwen+gemini       NO '?': gemini runs ON TOP of qwen's output, two LLM
 //                         passes. Legitimate option now, not a bug.
 //   sed+gemini+?qwen      cloud first, local as the reserve.
@@ -28,7 +31,14 @@
 // resolves to (BerkeleyMono Nerd Font, MDI block U+F0001-U+F1AF0). Written as
 // literal UTF-8: astral codepoints truncate in the 4-hex \u form.
 
-var DEFAULT_MODE = "sed+qwen+?gemini";
+// DEFAULT_MODE tem que ser IGUAL ao DEFAULT_SPEC do voxtype-punct: é o que os
+// dois usam quando o polish-mode some, vem vazio ou vem quebrado. Se divergirem,
+// o painel mostra uma pipeline e o ditado roda outra — e ninguém percebe, porque
+// as duas parecem plausíveis. Por isso NÃO tem nuvem aqui: um arquivo truncado
+// não pode virar "manda todo o ditado pro Google" sem ninguém escolher isso.
+// O apelido "auto" (em ALIASES) continua sendo sed+qwen+?gemini — a nuvem de
+// reserva é uma escolha explícita do usuário, nunca um fallback de falha.
+var DEFAULT_MODE = "sed+qwen";
 
 // Vocabulário de glyphs. Nomes conferidos contra a charset CFF da própria
 // fonte — os comentários antigos deste arquivo e do Panel.qml estavam errados
@@ -50,7 +60,7 @@ var G = {
 // nome + ícone, como fazem 12 de 12 linhas de lista dos painéis nativos.
 var STAGES = [
   { key: "sed",    label: "sed",    glyph: G.sed,    hint: "Correções fixas de transcrição. Offline, não pontua." },
-  { key: "qwen",   label: "qwen",   glyph: G.qwen,   hint: "LLM local na 3090 (vp-qwen7), ~250ms." },
+  { key: "qwen",   label: "qwen",   glyph: G.qwen,   hint: "O seu endpoint de LLM (llm.conf). Local: ~250ms." },
   { key: "gemini", label: "gemini", glyph: G.gemini, hint: "Nuvem. Cobra por token e o texto sai da máquina." }
 ];
 
@@ -60,9 +70,9 @@ var STAGES = [
 var MODES = [
   { code: "off",              label: "Off",      glyph: G.off,    hint: "Transcript cru" },
   { code: "sed",              label: "Local",    glyph: G.sed,    hint: "Só sed, nada sai da máquina" },
-  { code: "sed+qwen",         label: "RTX 3090", glyph: G.qwen,   hint: "sed + qwen local" },
+  { code: "sed+qwen",         label: "LLM",      glyph: G.qwen,   hint: "sed + o seu endpoint de LLM" },
   { code: "sed+gemini",       label: "Gemini",   glyph: G.gemini, hint: "sed + Gemini (nuvem)" },
-  { code: "sed+qwen+?gemini", label: "Auto",     glyph: G.qwen,   hint: "sed + qwen, nuvem de reserva" }
+  { code: "sed+qwen+?gemini", label: "Auto",     glyph: G.qwen,   hint: "sed + o seu LLM, nuvem de reserva" }
 ];
 
 var ALIASES = {
@@ -270,10 +280,16 @@ function hintFor(code)  { return entryFor(code).hint }
 
 // Botão direito / scroll continuam ciclando os 5 presets — volta rápida a uma
 // combinação conhecida sem abrir o painel.
+// A âncora de uma spec que não é preset é o FIM da lista, não o DEFAULT_MODE:
+// assim um scroll pra frente cai em MODES[0] (Off, offline), que é o destino
+// seguro. Ancorar no DEFAULT_MODE amarrava o ciclo à posição desse preset na
+// lista, então mudar o default movia silenciosamente onde o scroll aterrissa —
+// e com sed+qwen na posição 2 um scroll pra frente cairia em sed+gemini, ou
+// seja, mandaria o ditado pra nuvem por causa de um giro de dedo.
 function nextMode(code, step) {
   var n = MODES.length;
   var d = (step === undefined || step === null || !isFinite(step)) ? 1 : Math.round(step);
   var i = indexOfMode(code);
-  if (i === -1) i = indexOfMode(DEFAULT_MODE);
+  if (i === -1) i = n - 1;
   return MODES[((i + d) % n + n) % n].code;
 }

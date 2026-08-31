@@ -47,7 +47,20 @@ BIN_DIR="$HOME/.local/bin"
 VOX_CFG="$XDG_CONFIG/voxtype"
 VOX_STATE="$XDG_STATE/voxtype"
 HIST_FILE="$VOX_STATE/history.jsonl"
-PLUGIN_DIR="$XDG_CONFIG/omarchy/plugins"
+# systemd --user DOES honour XDG_CONFIG_HOME, so drop-in units follow it.
+SYSTEMD_USER="$XDG_CONFIG/systemd/user"
+# Deliberately NOT $XDG_CONFIG. Omarchy hardcodes its own config root:
+# omarchy-plugin-catalog reads   user_dir="$HOME/.config/omarchy/plugins"
+# omarchy-plugin-add   writes    PLUGINS_DIR="$HOME/.config/omarchy/plugins"
+# omarchy-shell-config edits     CONFIG_FILE="$HOME/.config/omarchy/shell.json"
+# On a machine with XDG_CONFIG_HOME set elsewhere, honouring it here would put
+# the symlink somewhere the catalog scan never walks: the installer would print
+# OK, exit 0, and the plugin would simply never appear, with rescanPlugins and
+# `omarchy plugin enable` both failing afterwards for a reason nothing on
+# screen explains. VOX_CFG and VOX_STATE above are a different matter -- those
+# are OUR paths and the wrapper resolves them through XDG, so they must stay.
+OMARCHY_CFG="$HOME/.config/omarchy"
+PLUGIN_DIR="$OMARCHY_CFG/plugins"
 PLUGIN_LINK="$PLUGIN_DIR/local.voxtype"
 WRAPPER="$BIN_DIR/voxtype-punct"
 # The same path as a TOML *basic* string. A pathname may legally contain a
@@ -121,8 +134,8 @@ the wrapper itself does):
   the [output.post_process] stanza in $VOX_CFG/config.toml
   this repo, symlinked to $PLUGIN_LINK
 
-It never installs packages, never touches $VOX_CFG/gemini.key, and
-never writes into $XDG_CONFIG/omarchy/shell.json.
+It never installs packages, never touches $VOX_CFG/gemini.key, never writes
+$VOX_CFG/llm.conf, and never writes into $OMARCHY_CFG/shell.json.
 
 Existing files are never silently clobbered: a destination that differs from
 the repo copy is backed up to <file>.bak.<epoch> first, and config.toml and
@@ -195,9 +208,11 @@ step "1/8  Preflight -- checking for the commands this setup needs"
 # machine is not the installer's business.
 # ==========================================================================
 missing_hard=()
-# wl-copy is required, not optional: it is how the bar plugin's history window
-# copies an entry back out, and how voxtype itself delivers text when
-# config.toml uses output mode "clipboard" instead of "type".
+# wl-copy is required, not optional, and not only for output mode "clipboard":
+# the config this installer writes uses mode = "paste", which puts the text on
+# the clipboard with wl-copy and THEN sends paste_keys. It is also how the bar
+# plugin's history window copies an entry back out (History.qml pipes into
+# wl-copy). The keystroke half of "paste" is checked separately, below.
 for c in voxtype jq curl sed wl-copy; do
   if command -v "$c" >/dev/null 2>&1; then
     ok "$c found ($(command -v "$c"))"
@@ -225,6 +240,36 @@ if command -v sed >/dev/null 2>&1; then
   fi
 fi
 
+# A keystroke driver for mode = "paste". config/config.toml.example ships
+# mode = "paste" + paste_keys = "shift+insert", so something has to press that
+# key. voxtype's own message, from the binary:
+#
+#   paste mode unavailable: no keystroke tool available (wtype needs
+#   WAYLAND_DISPLAY, eitype needs libei, ydotool needs daemon running)
+#
+# so ANY ONE of wtype / eitype / ydotool satisfies it -- which is why this is
+# not a plain entry in the loop above (that would report a missing dependency
+# to someone running ydotool perfectly happily). voxtype-bin lists all three as
+# OPTIONAL deps of the package, but for the config installed here one of them
+# is required: with none of them, fallback_to_clipboard = true means the text
+# lands on your clipboard and is never pasted anywhere, with no error.
+# wtype is the one to install on Hyprland/Wayland -- it is the package's own
+# recommendation and needs no daemon.
+typer=""
+for c in wtype eitype ydotool; do
+  if command -v "$c" >/dev/null 2>&1; then typer="$c"; break; fi
+done
+if [ -n "$typer" ]; then
+  ok "$typer found ($(command -v "$typer")) -- keystroke driver for mode = \"paste\""
+else
+  missing_hard+=("wtype")
+  need "no keystroke driver found (wtype, eitype or ydotool) -- required at runtime"
+  note "the config.toml installed here uses mode = \"paste\": voxtype copies the"
+  note "text and presses paste_keys. With no keystroke tool the text reaches your"
+  note "clipboard and stops there -- nothing is typed and nothing reports an error."
+  note "on Hyprland/Wayland:  sudo pacman -S wtype"
+fi
+
 have_ollama=0
 missing_soft=()
 for c in ollama omarchy ffmpeg python3; do
@@ -232,15 +277,18 @@ for c in ollama omarchy ffmpeg python3; do
     ok "$c found ($(command -v "$c"))"
     if [ "$c" = ollama ]; then have_ollama=1; fi
   else
-    # None of these are fatal: without ollama the local LLM stage is
-    # unavailable but sed and gemini still run; without omarchy you simply
-    # have no bar plugin, and the dictation pipeline does not depend on the
-    # plugin at all; ffmpeg and python3 are used only by the batch
-    # transcribe helper, never by live dictation.
+    # None of these are fatal. ollama is only ONE way to serve the 'qwen'
+    # stage -- that stage talks to whatever HTTP endpoint llm.conf names, so a
+    # machine with no ollama can still use it against a box on the LAN or a
+    # paid API. Without omarchy you simply have no bar plugin, and the
+    # dictation pipeline does not depend on the plugin at all; ffmpeg and
+    # python3 are used only by the batch transcribe helper, never by live
+    # dictation.
     missing_soft+=("$c")
     warn "$c NOT found -- optional"
     case "$c" in
-      ollama)  note "the 'qwen' (local LLM) stage will be unavailable; sed and gemini still work" ;;
+      ollama)  note "the 'qwen' stage can still run against a remote endpoint -- see llm.conf," ;
+               note "manual step 2 below. Only a LOCAL model needs ollama here." ;;
       omarchy) note "the bar plugin and history window will be unavailable; dictation still works" ;;
       ffmpeg)  note "only hermes-voxtype-transcribe (batch transcription of audio files) needs it" ;;
       python3) note "only hermes-voxtype-transcribe needs it; the installer also uses it, when" ;
@@ -379,9 +427,10 @@ note ""
 note "The pipeline is stages joined by '+', in execution order. A '?' prefix"
 note "means 'only run this step if the step above it failed'."
 note "  sed                    offline only (the default; no-op without rules)"
-note "  sed+qwen               local LLM via ollama, nothing leaves the machine"
-note "  sed+qwen+?gemini       local LLM, cloud ONLY if the local one went quiet"
-note "  sed+gemini             cloud on every dictation"
+note "  sed+qwen               the LLM endpoint llm.conf names (a local ollama"
+note "                         unless you point it elsewhere -- manual step 2)"
+note "  sed+qwen+?gemini       that endpoint, Google ONLY if it went quiet"
+note "  sed+gemini             Google on every dictation"
 note "  off                    no post-processing at all"
 note ""
 note "!! Any pipeline containing 'gemini' sends the full text of every dictation"
@@ -398,7 +447,8 @@ if [ "$have_ollama" -eq 1 ]; then
   note "ollama is installed on this machine, so the local-LLM pipeline is one"
   note "command away (nothing leaves the machine, no API key, no account):"
   note "  echo 'sed+qwen' > $mode_dst"
-  note "it needs the vp-qwen7 model -- see step 2 of the manual steps below."
+  note "it needs the vp-qwen7 model, and llm.conf pointing at this machine's"
+  note "ollama -- see step 2 of the manual steps below."
 fi
 
 # ==========================================================================
@@ -417,11 +467,15 @@ STANZA="$(cat <<EOF
 # failure it SILENTLY falls back to the raw transcript -- a wrong path produces
 # no error, just unpolished dictation.
 command = "$WRAPPER_TOML"
-# Worst case measured for "sed+qwen+?gemini" on the reference machine: local 4s
-# + gemini 15s (or gemini failing fast plus a 15s retry) ~= 19.5s, plus spawn
-# and jq margin. Exceeding this timeout DISCARDS the whole post-process (sed
-# included) and types the raw transcript, so on slower hardware raise it --
-# lowering it only loses polish.
+# Worst case for the longest spec this project ships, "sed+qwen+?gemini" (the
+# 'auto' alias), taken from the real timeouts in bin/voxtype-punct: 15s for a
+# qwen step (--connect-timeout 1 --max-time 15, LLM_TIMEOUT default 15) plus up
+# to 18s for a gemini step (--max-time 15, plus one conditional retry that only
+# fires after a *fast* failure), = ~33s, plus a second or two of spawn and jq
+# margin. That is what 35000 covers.
+# Exceeding this timeout DISCARDS the whole post-process (the sed stage
+# included) and types the raw transcript, so raise it on slower hardware or for
+# a longer spec -- lowering it only loses polish.
 timeout_ms = 35000
 EOF
 )"
@@ -435,15 +489,26 @@ EOF
 # Matches "[output.post_process]", "[ output . post_process ]",
 # ["output"."post_process"], with or without a trailing comment. Does NOT match
 # a commented-out header, which the shipped example also contains.
+#
+# 2>/dev/null on both: an unreadable config.toml, or a directory in its place,
+# otherwise sprays raw `grep: ...: Permission denied` lines into an otherwise
+# clean transcript before the readable_cfg check below gets to say anything
+# useful about it.
 has_pp_header() {
-  grep -qE '^[[:space:]]*\[[[:space:]]*"?output"?[[:space:]]*\.[[:space:]]*"?post_process"?[[:space:]]*\]' -- "$1"
+  grep -qE '^[[:space:]]*\[[[:space:]]*"?output"?[[:space:]]*\.[[:space:]]*"?post_process"?[[:space:]]*\]' -- "$1" 2>/dev/null
 }
 # The dotted and inline-table spellings: post_process = { command = ... },
 # post_process.command = ..., output.post_process = { ... }.
 has_pp_key() {
-  grep -qE '^[[:space:]]*("?output"?[[:space:]]*\.[[:space:]]*)?"?post_process"?[[:space:]]*[.=]' -- "$1"
+  grep -qE '^[[:space:]]*("?output"?[[:space:]]*\.[[:space:]]*)?"?post_process"?[[:space:]]*[.=]' -- "$1" 2>/dev/null
 }
 has_pp() { has_pp_header "$1" || has_pp_key "$1"; }
+
+# "Is this something I can read at all?" -- asked BEFORE toml_parses, because
+# toml_parses cannot tell a malformed file from an unreadable one and would
+# report a syntax error that does not exist, sending the user off to debug TOML
+# when the actual problem is a mode-000 file or a directory in its place.
+readable_cfg() { [ -f "$1" ] && [ -r "$1" ]; }
 
 # The value of an uncommented `command` key belonging to that table, in either
 # TOML string form -- basic "..." AND literal '...' -- and in either the table
@@ -543,6 +608,16 @@ if [ ! -e "$cfg" ]; then
     reject_new_cfg
   else
     ok "config.toml created from the example, post_process -> $WRAPPER"
+    # The same check the pre-existing-config branch below already makes, for
+    # the config this step wrote itself: step 2 may have FAILed, in which case
+    # this config points at a file that is not there. The run does exit 1 on
+    # that earlier FAIL, but an OK line that is untrue on its own terms is
+    # exactly how a user talks themselves out of reading the FAIL.
+    if [ ! -x "$WRAPPER" ]; then
+      warn "the command this config points at is not an executable file yet"
+      note "see the FAIL earlier in this run; until $WRAPPER exists,"
+      note "voxtype falls back SILENTLY to the raw transcript on every dictation."
+    fi
     if grep -qE 'SEU_USUARIO|YOUR_USERNAME|YOUR_USER' -- "$cfg"; then
       note "the example still mentions a placeholder username elsewhere in the"
       note "file (a comment, most likely); the post_process command is correct."
@@ -557,6 +632,18 @@ if [ ! -e "$cfg" ]; then
       note "  grep -n 'flash_attention\\|gpu_isolation' $cfg"
     fi
   fi
+elif ! readable_cfg "$cfg"; then
+  # Caught here, ahead of every branch below, because all of them read the file
+  # -- has_pp, pp_command_value and toml_parses alike -- and each one would
+  # blame the contents for what is really a permission or a file-type problem.
+  if [ -d "$cfg" ]; then
+    warn "$cfg is a directory, not a file -- not modified"
+  else
+    warn "$cfg exists but is not a readable file -- not modified"
+    note "  ls -l $cfg"
+  fi
+  note "fix that first, then re-run this installer. Until then voxtype cannot"
+  note "read it either, and no post-processing runs."
 elif has_pp "$cfg" && [ -n "$(pp_command_value "$cfg")" ]; then
   existing="$(pp_command_value "$cfg")"
   skip "config.toml already has a post_process command -- not modified"
@@ -675,21 +762,65 @@ step "8/8  Remaining manual steps (nothing below is executed)"
 # ==========================================================================
 cat <<EOF
 
-  1. Enable the bar plugin. This edits ~/.config/omarchy/shell.json, which the
+  1. Enable the bar plugin. This edits $OMARCHY_CFG/shell.json, which the
      installer will not do -- a bad edit there breaks the whole bar.
 
-       omarchy plugin validate "$PLUGIN_LINK"
+       omarchy-shell shell rescanPlugins
        omarchy plugin enable local.voxtype
 
-  2. Local LLM stage (optional -- needed for the 'qwen' stage).
+     The rescan is NOT optional and has to come first: 'enable' resolves the id
+     against the RUNNING shell's plugin registry, which was built at shell
+     startup and has never seen the symlink this installer just created.
+     Without it you get exactly this, and nothing is enabled:
+
+       omarchy-plugin-enable: plugin 'local.voxtype' is not known;
+       run: omarchy-shell shell rescanPlugins
+
+     Optional, to lint the plugin folder against Omarchy's manifest schema:
+
+       omarchy plugin validate "$PLUGIN_LINK/"
+
+     Keep that TRAILING SLASH. The check refuses symlinks anywhere inside a
+     plugin folder, and without the slash 'find' reports the plugin directory
+     itself -- a symlink, by design, since that is how this repo is installed:
+
+       omarchy-plugin-validate: symlinks are not allowed inside a plugin
+       folder: $PLUGIN_LINK
+
+     With the slash find follows the link and the check passes. A pass prints
+     NOTHING at all and exits 0 -- silence is the success case here.
+
+  2. The 'qwen' stage endpoint (optional -- only if your pipeline uses 'qwen').
+
+     That stage posts to whatever HTTP endpoint $VOX_CFG/llm.conf
+     names. Without the file it assumes a local ollama on
+     http://localhost:11434/api/generate. The installer does not write it for
+     you -- your endpoint is your business:
+
+       cp "$SRC/config/llm.conf.example" "$VOX_CFG/llm.conf"
+
+     Then edit LLM_URL and LLM_MODEL. It has to be a FILE and not an exported
+     variable: the wrapper is spawned by the voxtype daemon under
+     systemd --user, so nothing you export in a shell ever reaches it.
+     The file is parsed with a key whitelist, never sourced, and does NOT
+     expand '~' -- write absolute paths.
+
+     For a LOCAL model, which is what the default URL expects:
 
        sudo systemctl enable --now ollama
        ollama pull qwen2.5:7b
        ollama create vp-qwen7 -f "$SRC/config/vp-qwen.Modelfile"
 
-     On a card with less than ~10 GB VRAM, edit the Modelfile to
-     'FROM qwen2.5:3b' first -- vp-qwen7 occupies about 6.6 GB, and if
-     OLLAMA_KEEP_ALIVE=-1 is set it stays resident permanently.
+     then set LLM_MODEL = vp-qwen7 in llm.conf. On a card with less than
+     ~10 GB VRAM, edit the Modelfile to 'FROM qwen2.5:3b' first -- vp-qwen7
+     occupies about 6.6 GB, and if OLLAMA_KEEP_ALIVE=-1 is set it stays
+     resident permanently.
+
+     Note LLM_SEND_SYSTEM defaults to 1, so the stage sends
+     polish-prompt.txt as its system prompt on every request. Leave it on
+     unless your model has that prompt baked in (vp-qwen7 does): a stock
+     qwen2.5 with no system prompt does not punctuate your dictation, it
+     CONVERSES with it, and the reply is what lands in your editor.
 
   3. Cloud stage (optional -- needed for the 'gemini' stage).
 
@@ -711,15 +842,15 @@ cat <<EOF
 
   5. Optional NVIDIA multi-GPU drop-in (only if you use the Whisper/Vulkan lane):
 
-       mkdir -p ~/.config/systemd/user/voxtype.service.d
-       cp "$SRC/config/systemd/gpu.conf" ~/.config/systemd/user/voxtype.service.d/
+       mkdir -p "$SYSTEMD_USER/voxtype.service.d"
+       cp "$SRC/config/systemd/gpu.conf" "$SYSTEMD_USER/voxtype.service.d/"
 
   6. Restart the daemon so it picks up config.toml, and verify:
 
        systemctl --user daemon-reload
        systemctl --user restart voxtype
        voxtype setup check
-       printf 'hello world' | "$WRAPPER"
+       printf 'hello world' | VOX_NO_HISTORY=1 "$WRAPPER"
 
      That last command prints "hello world" UNCHANGED with the pipeline this
      installer sets up ('sed', with no rules file). Unchanged output IS the
@@ -727,10 +858,13 @@ cat <<EOF
      give it rules, and an LLM stage is something you opt into (see step 2 and
      step 3 above). To see which stages actually ran:
 
-       printf 'hello world' | VOX_TRACE=1 "$WRAPPER"
+       printf 'hello world' | VOX_TRACE=1 VOX_NO_HISTORY=1 "$WRAPPER"
 
      That prints the pipeline and every stage's decision on stderr. If it
      prints nothing at all, the wrapper is not the file voxtype is calling.
+
+     VOX_NO_HISTORY=1 is on both commands on purpose: without it your test
+     sentences are appended to the permanent dictation log described in step 7.
 
   7. The dictation log -- turn it off if you do not want one.
 
@@ -739,9 +873,9 @@ cat <<EOF
      (mode 0600, never leaves the machine, pruned automatically). This is the
      symmetric opt-out to the cloud opt-in in step 3:
 
-       mkdir -p ~/.config/systemd/user/voxtype.service.d
+       mkdir -p "$SYSTEMD_USER/voxtype.service.d"
        printf '[Service]\nEnvironment=VOX_NO_HISTORY=1\n' \\
-         > ~/.config/systemd/user/voxtype.service.d/no-history.conf
+         > "$SYSTEMD_USER/voxtype.service.d/no-history.conf"
        systemctl --user daemon-reload && systemctl --user restart voxtype
 
      Note that the bar plugin's history window reads that same file, so with

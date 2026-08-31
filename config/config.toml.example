@@ -171,8 +171,9 @@ model = "parakeet-tdt-0.6b-v3"
 # Editing by hand: put your own username in the path below (see: whoami).
 # The `install` script rewrites this line for you with the resolved path.
 command = "/home/YOUR_USERNAME/.local/bin/voxtype-punct"
-# Worst case for the default "sed+qwen+?gemini" spec, taken from the real
-# timeouts in bin/voxtype-punct: 15s for a qwen step (--connect-timeout 1
+# Worst case for the longest spec this project ships, "sed+qwen+?gemini" (the
+# 'auto' alias, which you have to select deliberately — no default pipeline
+# contains a cloud stage), taken from the real timeouts in bin/voxtype-punct: 15s for a qwen step (--connect-timeout 1
 # --max-time 15) plus up to 18s for a gemini step (--max-time 15, plus one
 # conditional retry that only fires after a *fast* failure), = ~33s, plus a
 # second or two of spawn and jq margin. That is what 35000 covers.

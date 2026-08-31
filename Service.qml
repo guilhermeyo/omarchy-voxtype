@@ -50,9 +50,13 @@ Item {
   // take effect" the way bringing up tun0 can.
   property string mode: Model.DEFAULT_MODE
 
-  // false = the file is missing/unreadable. The wrapper treats that as `auto`
-  // (see Model.js header), so `mode` still reads auto; this only drives the
-  // "file missing" note in the panel hero.
+  // false = the file is missing/unreadable. Painel e wrapper caem no MESMO
+  // default nesse caso — Model.DEFAULT_MODE aqui, DEFAULT_SPEC no
+  // voxtype-punct, e os dois valem `sed+qwen`. Ancorado na constante de
+  // propósito: a versão anterior deste comentário dizia "auto", que é o apelido
+  // da spec COM nuvem, e a string do painel copiou o erro e passou a prometer
+  // ao usuário que um arquivo sumido mandava o ditado pro Google.
+  // Este flag só liga o aviso "file missing" no hero do painel.
   property bool fileReadable: false
 
   readonly property var entry: Model.entryFor(mode)

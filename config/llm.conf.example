@@ -1,8 +1,8 @@
 # ~/.config/voxtype/llm.conf — where the `qwen` pipeline stage sends your text.
 #
 # Copy this file to ~/.config/voxtype/llm.conf and edit it. Without it the stage
-# talks to a local ollama on http://localhost:11434, which is only useful if you
-# are actually running one.
+# posts to a local ollama at http://localhost:11434/api/generate asking for the
+# model vp-qwen7 — which is only useful if you are actually running one.
 #
 # WHY A FILE AND NOT AN ENVIRONMENT VARIABLE: voxtype-punct is spawned by the
 # voxtype daemon under systemd --user, so an `export` in your shell never
@@ -11,6 +11,8 @@
 #
 # Format: KEY=value, one per line, '#' starts a comment, quotes around the value
 # are optional. The file is PARSED, never sourced — it cannot run commands.
+# It also does NO shell expansion: `~` stays a literal tilde and $VARS are not
+# substituted. Every path below must be absolute.
 
 # ── The endpoint ────────────────────────────────────────────────────────────
 # Any HTTP endpoint you can reach. It does NOT have to be this machine: point it
@@ -26,7 +28,16 @@
 LLM_URL = http://localhost:11434/api/generate
 
 # The model name as the endpoint knows it.
-LLM_MODEL = qwen2.5:7b
+#
+# Shipped as vp-qwen7 — the model the install flow builds with
+#   ollama create vp-qwen7 -f config/vp-qwen.Modelfile
+# and the same name voxtype-punct falls back to when this file is absent. Change
+# it and nothing else breaks; leave it and copying this file changes nothing.
+#
+# Pointing at a stock model instead is fine — keep LLM_SEND_SYSTEM on (below)
+# and the punctuation prompt is sent with every request:
+#   LLM_MODEL = qwen2.5:7b
+LLM_MODEL = vp-qwen7
 
 # ── Optional ────────────────────────────────────────────────────────────────
 # API shape. Left unset it is deduced from the URL path, which is right almost
@@ -37,7 +48,14 @@ LLM_MODEL = qwen2.5:7b
 # Bearer token for endpoints that need one. Point at a file, not the token
 # itself — the token never belongs in a config file you might share.
 # Create it with: install -m 600 /dev/null ~/.config/voxtype/llm.key
-# LLM_KEY_FILE = ~/.config/voxtype/llm.key
+#
+# ABSOLUTE PATH ONLY. This file is parsed, not sourced, so `~` is NOT expanded:
+# a value like ~/.config/voxtype/llm.key is read as a literal filename, the file
+# is not found, no Authorization header is sent, and the endpoint answers 401 —
+# which the wrapper reports only as `FAIL qwen (text intacto)`. Unset, the
+# wrapper looks for ~/.config/voxtype/llm.key on its own, so most people can
+# leave this line commented out and just create that file.
+# LLM_KEY_FILE = /home/YOUR_USERNAME/.config/voxtype/llm.key
 
 # Send the punctuation prompt (polish-prompt.txt) with every request. Default 1.
 #

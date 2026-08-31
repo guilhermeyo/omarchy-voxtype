@@ -202,7 +202,7 @@ Panel {
           width: parent.width
           title: "Voxtype"
           detail: ""
-          meta: svc.fileReadable ? "" : "mode file missing — wrapper falls back to auto"
+          meta: svc.fileReadable ? "" : "mode file missing — falls back to " + Model.DEFAULT_MODE
           foreground: root.foreground
           fontFamily: root.fontFamily
           iconOpacity: svc.mode === "off" ? 0.5 : 1.0

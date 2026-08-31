@@ -249,14 +249,28 @@ block, the bar icon, all four panel controls and both history buttons render as
 tofu boxes. Nothing else breaks; it just becomes unreadable.
 
 ```bash
-# every glyph this plugin draws, in one query — needs at least one hit
-fc-list ":charset=f036c f0451 f08ae f015f f0cb4 f02da f018f" family | head
+# all twelve glyphs this plugin draws, in one query — needs at least one hit
+fc-list ":charset=f036c f036d f0451 f08ae f015f f0cb4 f0143 f0140 f0156 f0415 f02da f018f" family | head
 ```
 
-`f036c` microphone · `f0451` regex (`sed`) · `f08ae` expansion card (`qwen`) ·
-`f015f` cloud (`gemini`) · `f0cb4` parachute (fallback) · `f02da` history ·
-`f018f` copy. On the reference machine 18 installed families match; the bar font
-there is BerkeleyMono Nerd Font.
+Twelve codepoints, enumerated from the source rather than from memory —
+`Model.js` defines ten of them in its `G` table, `Panel.qml` and `History.qml`
+the last two:
+
+`f036c` microphone (panel identity) · `f036d` microphone-off (the bar icon
+whenever the pipeline is `off`) · `f0451` regex (`sed`) · `f08ae` expansion card
+(`qwen`) · `f015f` cloud (`gemini`) · `f0cb4` parachute (fallback) · `f0143` /
+`f0140` chevrons (reorder a stage) · `f0156` close (remove a stage) · `f0415`
+plus (add a stage) · `f02da` history · `f018f` copy.
+
+The five reorder/add/remove glyphs are the ones a shorter query misses, and they
+are exactly the panel controls this README later tells you to click — a font
+that carries the bar icon but not the chevrons passes a partial check and then
+renders tofu where you are looking. On the reference machine the full query
+prints 18 lines covering six distinct families — BerkeleyMono, JetBrainsMono,
+Symbols and three CaskaydiaMono variants, all Nerd Fonts; the bar font there is
+BerkeleyMono Nerd Font. Any one hit is enough. (`| head` is only to keep the
+output short; drop it, or add `| sed 's/,.*//' | sort -u`, to see the families.)
 
 ### Omarchy / Quickshell
 
@@ -392,8 +406,12 @@ What it does: checks for the commands this setup needs; installs
 `config/polish-prompt.txt`; writes a default `polish-mode` of `sed`; wires the
 absolute `post_process` path into `config.toml`, backing up what was there and
 verifying the result still parses as TOML; and symlinks the repo to
-`~/.config/omarchy/plugins/local.voxtype`. Paths follow `XDG_CONFIG_HOME` and
-`XDG_STATE_HOME`, exactly as the wrapper does.
+`~/.config/omarchy/plugins/local.voxtype`. Its voxtype paths follow
+`XDG_CONFIG_HOME` and `XDG_STATE_HOME`, exactly as the wrapper does. The
+**plugin** path is the one exception, and deliberately so: Omarchy's own
+`omarchy-plugin-catalog` and `omarchy-plugin-add` hardcode
+`$HOME/.config/omarchy/plugins`, so the installer hardcodes it too — following
+`XDG_CONFIG_HOME` there would link the plugin somewhere the bar never looks.
 
 What it deliberately does **not** do:
 
@@ -432,23 +450,66 @@ Then pick a backend. `/usr/bin/voxtype` is a generated dispatch wrapper owned by
 no package; `voxtype setup onnx --enable` and `voxtype setup gpu --enable` both
 rewrite it, which is why the two disagree (see Troubleshooting).
 
+`voxtype setup onnx --enable` takes no backend argument — it auto-detects your
+hardware and picks one of the ONNX binaries `voxtype-bin` already shipped (they
+all install together; `ls /usr/lib/voxtype/` shows the set). Your job is to
+install the runtime libraries that binary needs, then run the same command.
+Pick the block that matches your machine:
+
 ```bash
 # NVIDIA, Parakeet on CUDA — what this repo is tuned for
 sudo pacman -S cuda cudnn nvidia-open-dkms nvidia-utils   # driver 580+ required
 sudo voxtype setup onnx --enable
-
-# AMD: picks voxtype-onnx-migraphx, also needs rocm-hip-runtime + migraphx
-# CPU / Intel: picks voxtype-onnx-avx512 or -avx2, Parakeet on CPU
-# Whisper via Vulkan (works on NVIDIA/AMD/Intel):
-#   sudo pacman -S vulkan-icd-loader && sudo voxtype setup onnx --disable
 ```
-
-**Verify:**
 
 ```bash
-voxtype setup onnx --status     # -> "Active engine: Parakeet / Backend: ONNX (CUDA 13)"
-voxtype info variants           # -> "Binary: .../voxtype-onnx-cuda-13"
+# AMD, Parakeet on ROCm — same command, different runtime
+sudo pacman -S rocm-hip-runtime migraphx     # both in the Arch `extra` repo
+sudo voxtype setup onnx --enable             # picks voxtype-onnx-migraphx
 ```
+
+```bash
+# Intel, or no GPU at all — Parakeet on the CPU, no extra packages
+sudo voxtype setup onnx --enable             # picks voxtype-onnx-avx512 or -avx2
+```
+
+```bash
+# Or leave ONNX off entirely and run Whisper on Vulkan (NVIDIA/AMD/Intel alike)
+sudo pacman -S vulkan-icd-loader
+sudo voxtype setup onnx --disable
+```
+
+The AMD and Intel/CPU paths are **unverified** — the reference machine has an
+NVIDIA card, so `--enable` was only ever observed choosing the CUDA binary.
+What *is* verified here is that the AMD binary ships in the same package as the
+CUDA one — `pacman -Qo /usr/lib/voxtype/voxtype-onnx-migraphx` answers
+`voxtype-bin 0.7.5-1`, and `voxtype setup onnx --status` lists `ONNX (MIGraphX)`
+as *installed* on a machine with no ROCm packages at all, because the provider
+is loaded through `libonnxruntime_providers_migraphx.so` at run time rather
+than at start-up. There is nothing extra to download; only the two `pacman`
+packages above.
+
+**Verify — read your own hardware's answer, not this machine's:**
+
+```bash
+voxtype setup onnx --status     # must name Parakeet as the active engine,
+                                # and an ONNX backend that is not an error
+voxtype info variants           # the "Binary:" line must be a file that exists
+```
+
+The backend string is your hardware's, and every one of these is a success:
+
+| Your hardware | `Backend:` line |
+|---|---|
+| NVIDIA | `ONNX (CUDA 13)`, `ONNX (CUDA 12)` or `ONNX (CUDA)` |
+| AMD | `ONNX (MIGraphX)` |
+| Intel / CPU | `ONNX (AVX-512)` or `ONNX (AVX2)` |
+
+`--status` also prints an *Available ONNX backends* list with one marked
+`active`, and `voxtype info variants` prints a *Recommended for this hardware*
+line — if the active variant is not the recommended one, that is the thing to
+chase. On the reference machine `--status` reports `Active engine: Parakeet` /
+`Backend: ONNX (CUDA 13)` / `Binary: /usr/lib/voxtype/voxtype-onnx-cuda-13`.
 
 ### 2. The model
 
@@ -496,6 +557,22 @@ or with `./install`, which substitutes the path in bash and re-reads the line to
 confirm — a scripted `sed -i` is a trap, because `&`, `\`, `"` and `#` are all
 metacharacters in either sed's replacement or TOML's string syntax, and a home
 directory containing one produces a `config.toml` that no longer parses.
+
+**On AMD, Intel or CPU-only hardware, edit two more lines in the same file:**
+
+```toml
+flash_attention = false     # ships true  (config.toml.example line 60)
+gpu_isolation   = false     # ships true  (config.toml.example line 62)
+```
+
+Both ship `true` because the reference machine is NVIDIA, and both are
+**CUDA-build specific**. A wrong value here can stop the model loading, not
+merely slow it down. They belong to voxtype's Whisper lane rather than to
+anything in this repo, which is why it is easy to walk past them — `./install`
+warns about them when it wires up `config.toml`, and the manual path is the one
+that does not, so this is the paragraph doing that job. (Step 5 raises them
+again, because that is where a non-NVIDIA reader tends to arrive; there is only
+one edit to make, here.)
 
 `sed` is the deliberate starting pipeline, and it is what `./install` writes: one
 offline stage that is a no-op until you give it rules. It is never `auto` or
@@ -587,12 +664,12 @@ Restart the service after **every** `config.toml` edit.
 The stage named `qwen` is not "ollama on this machine" — it is *your* LLM
 endpoint, declared in `<config>/llm.conf`. Local ollama is only the default.
 
-```bash
-cp config/llm.conf.example ~/.config/voxtype/llm.conf   # then edit it
-```
-
-For a local ollama, the shipped defaults already match and you can skip the file
-entirely:
+**Build the model first, write the config file second.** `llm.conf` sets
+`LLM_MODEL`, and whatever it says outranks the wrapper's own default of
+`vp-qwen7` — so by the time you dictate, that name has to be a model your
+endpoint actually serves. Doing it in this order means the two cannot disagree,
+and a disagreement has no symptom other than `FAIL qwen` in a trace you are not
+watching.
 
 ```bash
 # NVIDIA / AMD / neither — pick ONE of the accelerator packages
@@ -606,11 +683,34 @@ ollama create vp-qwen7 -f config/vp-qwen.Modelfile
 ```
 
 `ollama-cuda` is NVIDIA-only; installing it on an AMD or CPU box gets you
-nothing. Note also that `config/config.toml.example` sets `flash_attention` and
-`gpu_isolation` to `true`, which are **CUDA-build specific** — set both to
-`false` on AMD, Intel or CPU. Those two are about voxtype's Whisper lane, not
-about ollama, but they come from the same reference machine and they are the
-other place a non-NVIDIA setup needs a hand edit.
+nothing. If you have not already done it in step 3, this is the other place a
+non-NVIDIA setup needs a hand edit: `config/config.toml.example` ships
+`flash_attention = true` and `gpu_isolation = true`, which are **CUDA-build
+specific** — set both to `false` on AMD, Intel or CPU. Those two belong to
+voxtype's Whisper lane, not to ollama; they are named here only because this is
+where a non-NVIDIA reader tends to arrive.
+
+Now the config file:
+
+```bash
+cp config/llm.conf.example ~/.config/voxtype/llm.conf
+$EDITOR ~/.config/voxtype/llm.conf     # make LLM_MODEL match what you built
+```
+
+**Check `LLM_MODEL` against the model you actually created.** The example ships
+`LLM_MODEL = vp-qwen7`, which is both what the `ollama create` above builds and
+what the wrapper falls back to with no file at all — so if you followed this
+step in order, the copy changes nothing and you are done. If you skipped the
+build and are pointing at a stock model, put that model's name here instead: the
+`qwen` stage sends `polish-prompt.txt` as its system prompt by default, so a
+stock model works without a custom build. Either is fine; a mismatch is not, and
+it surfaces only as `FAIL qwen (text intacto)`, with your text passing through
+unpunctuated.
+
+If your endpoint is a local ollama serving `vp-qwen7`, you can skip `llm.conf`
+altogether — that is exactly what the wrapper defaults to
+(`http://localhost:11434/api/generate`, model `vp-qwen7`) when the file is
+absent.
 
 On a card smaller than **~10 GB**, point the Modelfile at `FROM qwen2.5:3b`
 instead (1.9 GB) — `vp-qwen7` is 6.6 GB resident and its 32k context needs KV
@@ -656,6 +756,17 @@ intacto)` ("qwen failed, text unchanged") means the model name or the endpoint
 is wrong — and note the text still comes out, unpolished. That is the whole
 design.
 
+That was a one-off override, and it does not change anything permanently.
+`VOX_MODE` never reaches a real dictation: the daemon spawns the wrapper under
+`systemd --user`, where your shell's environment does not exist — which is the
+same reason `llm.conf` is a file. To make this the live pipeline, write it:
+
+```bash
+echo 'sed+qwen' > ~/.config/voxtype/polish-mode
+```
+
+Or click it in the bar panel, which writes the same file.
+
 ### 6. The cloud stage (optional)
 
 The wrapper calls the **Gemini Developer API** (Google AI Studio), not Vertex
@@ -685,6 +796,13 @@ is missing/empty. The second one is deliberate: without a system prompt Gemini
 
 ### 7. The bar plugin
 
+> **Steps 7 and 8 are Omarchy-only.** If `command -v omarchy-shell` finds
+> nothing, you are already done — skip to step 9. The wrapper from step 3 is the
+> entire post-processor; it punctuates your dictation with no bar, no plugin and
+> no Quickshell. What you give up is the pipeline picker and the history window,
+> both of which are conveniences over files you can edit by hand
+> (`~/.config/voxtype/polish-mode` and `~/.local/state/voxtype/history.jsonl`).
+
 Third-party Omarchy plugins live in `~/.config/omarchy/plugins/<id>/`, exactly
 one directory level down, and the catalog scan follows symlinks — so a symlink
 is the supported way to run this from a checkout. `manifest.json` sits at the
@@ -713,8 +831,13 @@ omarchy-shell shell rescanPlugins    # the running bar has not seen the new dir
 omarchy plugin enable local.voxtype
 ```
 
-Or just run `./install`, which refuses to touch a real directory there and tells
-you the same two commands.
+`./install` does the linking half of that for you. Finding a real directory in
+the way it refuses to touch it and prints the `mv` / `ln -s` pair above instead
+of guessing. Its closing manual steps then print the last two commands verbatim
+— `omarchy-shell shell rescanPlugins`, then `omarchy plugin enable
+local.voxtype`, in that order — plus the trailing-slash `omarchy plugin
+validate` as an optional lint. It never runs any of them: enabling means editing
+`shell.json`, and that stays yours.
 
 The `rescanPlugins` call is not optional. `omarchy plugin enable` does not look
 at the filesystem — it resolves the id against the *running* shell's plugin
@@ -979,11 +1102,15 @@ Three rules that catch everyone:
   `3090+gemini` is `qwen+gemini`, with no sed step at all. Write the stages you
   want explicitly.
 
-> **Known divergence:** the wrapper's failure-safe default is `sed+qwen`, but
-> `Model.js` still has `DEFAULT_MODE = "sed+qwen+?gemini"`. With no `polish-mode`
-> file at all, the bar therefore *displays* `sed → qwen ⇢ gemini` while the
-> wrapper *runs* `sed+qwen`. Writing anything from the panel resolves it, and so
-> does `echo 'sed+qwen' > <config>/polish-mode`.
+> **The two parsers agree on this.** `Model.js` has `DEFAULT_MODE = "sed+qwen"`
+> and `bin/voxtype-punct` has `DEFAULT_SPEC="sed+qwen"`, so a missing, empty or
+> unparseable `polish-mode` resolves the same way on both sides: the bar reads
+> `LLM` with the GPU glyph, and the wrapper runs `sed+qwen`. Verified by
+> evaluating `Model.js` under node and by running the wrapper with the mode file
+> absent, empty, all-whitespace, `xyz`, `sed+banana`, `+` and `??` — every one
+> of them resolves to `sed+qwen` on both sides. They have to stay in step: if they
+> ever drift, the panel shows one pipeline and the dictation runs another, and
+> both look plausible.
 
 ### Failure policy
 
@@ -1081,13 +1208,50 @@ therefore over-report the cloud; it can never under-report it. An unconditional
 | Scroll up | Previous preset |
 | Middle click | Re-read `polish-mode` from disk |
 
-**Right-click and scroll cycle the five presets only, and a hand-built pipeline
-is one scroll away from being replaced by one.** The lookup for a custom spec
-returns -1, the widget pretends you were sitting on the default (`sed+qwen+?gemini`,
-the last preset in the list) and then steps off it — so from *any* custom
-pipeline, a right-click or scroll down lands on `off`, and a scroll up lands on
-`sed+gemini`, which sends every dictation to Google. Verified by evaluating
-`Model.js`:
+The five presets, in the order the scroll walks them, with the name the bar
+actually prints (`Model.js`, `MODES`). The bar tooltip is `Voxtype · <label>`
+and the panel prints the same label in its header:
+
+| Spec | Label | Bar glyph | `hint` string |
+|---|---|---|---|
+| `off` | **Off** | microphone-off | *Transcript cru* — raw transcript |
+| `sed` | **Local** | regex | *Só sed, nada sai da máquina* — sed only, nothing leaves the machine |
+| `sed+qwen` | **LLM** | expansion card | *sed + o seu endpoint de LLM* — sed plus your own endpoint |
+| `sed+gemini` | **Gemini** | cloud | *sed + Gemini (nuvem)* — sed plus Gemini, in the cloud |
+| `sed+qwen+?gemini` | **Auto** | expansion card | *sed + o seu LLM, nuvem de reserva* — your LLM, cloud in reserve |
+
+That last column is `MODES[i].hint`. `Service.qml` re-exports it as `svc.hint`,
+but no view renders it today — the panel's own tooltips come from the **stage**
+hints instead, which are the strings you will actually hover:
+
+| Stage row | Tooltip |
+|---|---|
+| `sed` | *Correções fixas de transcrição. Offline, não pontua.* — fixed transcription repairs; offline, adds no punctuation |
+| `qwen` | *O seu endpoint de LLM (llm.conf). Local: ~250ms.* — **your** LLM endpoint, from `llm.conf`; ~250 ms when it is local |
+| `gemini` | *Nuvem. Cobra por token e o texto sai da máquina.* — cloud; billed per token, and your text leaves the machine |
+
+A row marked as a fallback gets `  ·  só roda se o passo anterior falhar`
+("only runs if the previous step failed") appended to its tooltip.
+
+`sed+qwen` is labelled **LLM**, not the author's graphics card, and the `qwen`
+tooltip says *your* endpoint: the stage is whatever `llm.conf` names, which is
+why the glyph is a GPU and the name is not. The old `3090` spelling still
+parses, both as a whole-string alias and as a token.
+
+Anything that is not one of those five rows is a custom pipeline, and the bar
+reads the spec itself instead of a name: `sed+sed` shows `sed → sed`, and
+`sed+qwen+?gemini+sed` shows `sed → qwen  󰲴  gemini → sed` — the parachute
+replaces the `?`, because "only if the one above failed" is a relation *between*
+two steps and belongs in the connector. Both verified by evaluating `Model.js`.
+
+**Right-click and scroll cycle those five presets only, and a hand-built
+pipeline is one scroll away from being replaced by one.** The lookup for a
+custom spec returns -1, so the widget anchors you at the **end of the preset
+list** (`sed+qwen+?gemini`, *Auto*) and steps off from there — deliberately the
+end of the list rather than `DEFAULT_MODE`, so that changing the default cannot
+silently move where a scroll lands. From *any* custom pipeline, a right-click or
+scroll down therefore lands on `off`, and a scroll up lands on `sed+gemini`,
+which sends every dictation to Google. Verified by evaluating `Model.js`:
 
 ```
 nextMode("sed+sed", +1) -> "off"        nextMode("sed+sed", -1) -> "sed+gemini"
@@ -1154,15 +1318,26 @@ voxtype — a systemd user drop-in is the clean way:
 
 ```bash
 mkdir -p ~/.config/systemd/user/voxtype.service.d
-printf '[Service]\nEnvironment="VOX_NO_HISTORY=1"\n' > \
-  ~/.config/systemd/user/voxtype.service.d/nohistory.conf
+printf '[Service]\nEnvironment=VOX_NO_HISTORY=1\n' > \
+  ~/.config/systemd/user/voxtype.service.d/no-history.conf
 systemctl --user daemon-reload && systemctl --user restart voxtype
 ```
 
-The plugin's history window then stays empty — it reads that same file. Or point
-`VOX_HISTORY` at a path on an encrypted volume. Deleting the file is enough; it
-is recreated only if history is still enabled. To destroy what is already in it,
-see [Uninstall](#uninstall).
+That is the same filename and the same line `./install` prints in its closing
+manual steps, so following both leaves you with one drop-in rather than two
+setting the same variable.
+
+The plugin's history window then stays empty — it reads that same file.
+
+Or point `VOX_HISTORY` at a path on an encrypted volume — **the history window
+goes empty for that too.** `History.qml:31` hardcodes
+`$HOME/.local/state/voxtype/history.jsonl` and, unlike `polish-mode` with its
+`modePath` setting, has no way to follow you: the wrapper writes where you sent
+it and the widget keeps reading the old path. Same asymmetry as
+`XDG_STATE_HOME`, which the wrapper honours and the widget does not.
+
+Deleting the file is enough; it is recreated only if history is still enabled.
+To destroy what is already in it, see [Uninstall](#uninstall).
 
 ### 2. The `gemini` stage sends your dictation to Google
 
@@ -1247,9 +1422,9 @@ falls back to on its own — and leave `LLM_URL` pointing at localhost.
 | Typed text comes out scrambled, interleaved, or the cursor jumps to the start mid-sentence | `mode = "type"` sends one synthetic keystroke per character; with fcitx5 active each one goes through the input engine and races the app | Use `mode = "paste"` with `paste_keys = "shift+insert"`. This is what the shipped config does and why. |
 | Raw, unpunctuated text appears | The post-process was discarded whole. Either `timeout_ms` was blown, or `[output.post_process] command` points at a path that does not exist — both fail **silently** | `grep '^command' ~/.config/voxtype/config.toml` and confirm the absolute path exists. Then check your spec against the 15 s-per-qwen / 18 s-per-gemini budget and raise `timeout_ms`. |
 | Punctuation works in the terminal but not from the hotkey | `config.toml` was edited without restarting the daemon | `systemctl --user restart voxtype` |
-| Everything renders as empty boxes — bar icon, panel controls, history buttons | The bar's font has no Material Design Icons block; the widget inherits that font | Install a Nerd Font ≥ 3.x and set it as the bar font. Check with `fc-list ":charset=f0cb4" family`. |
+| Everything renders as empty boxes — bar icon, panel controls, history buttons | The bar's font has no Material Design Icons block; the widget inherits that font | Install a Nerd Font ≥ 3.x and set it as the bar font. Check it with the twelve-codepoint `fc-list` query under "A Nerd Font carrying the Material Design Icons block" — a one-glyph spot check can pass on a font that still tofus the panel controls. |
 | Bar icon does not update when the mode changes | Wrong `modePath` in `shell.json`, or `polish-mode` lives outside `~/.config/voxtype` — the widget also watches the parent directory, but only that one | Middle-click the icon to force a re-read. Confirm with `cat ~/.config/voxtype/polish-mode`, and set `modePath` explicitly if the file is elsewhere. |
-| The bar shows one pipeline and the wrapper runs another | Either you moved `XDG_CONFIG_HOME` (the wrapper follows it, the widget does not), or there is no `polish-mode` file at all (the two defaults differ — see "The pipeline spec") | Write the file: `echo 'sed+qwen' > <config>/polish-mode`, and set `modePath` in `shell.json` to that same absolute path. |
+| The bar shows one pipeline and the wrapper runs another | You moved `XDG_CONFIG_HOME`: the wrapper follows it, the widget does not, so the two are reading different files. (The two *defaults* agree — both fall back to `sed+qwen` — so a missing file is not this symptom.) | Set `modePath` in `shell.json` to the wrapper's absolute path, and confirm with `cat "${XDG_CONFIG_HOME:-$HOME/.config}/voxtype/polish-mode"`. |
 | Panel does not appear after install | The plugin id is not in the bar layout, or `manifest.json` is not exactly one directory below `~/.config/omarchy/plugins/` — including the case where `ln -s` nested the link inside an existing directory | `readlink -f ~/.config/omarchy/plugins/local.voxtype` must print your checkout. Then `omarchy-shell shell rescanPlugins` and `omarchy plugin enable local.voxtype`. |
 | `omarchy plugin enable` says the plugin *is not known* | The running shell's registry was built before the symlink appeared; `enable` never looks at the filesystem | `omarchy-shell shell rescanPlugins`, then enable again. |
 | `omarchy plugin validate` fails with *symlinks are not allowed inside a plugin folder* | You linked the checkout into the plugins directory and left the trailing slash off the path — validate counts the directory symlink itself as a violation | Add the slash: `omarchy plugin validate ~/.config/omarchy/plugins/local.voxtype/`. Cosmetic either way; the running shell has no such rule and loads the plugin fine. |
@@ -1342,6 +1517,7 @@ wherever your backups go.
 ## Repo layout
 
 ```
+README.md              this document
 manifest.json          plugin manifest — must sit at the plugin root
 Panel.qml              bar icon + pipeline editor (the bar-widget entry point)
 Service.qml            watches and writes polish-mode
@@ -1358,6 +1534,10 @@ bin/hermes-voxtype-transcribe
                        build with the `transcribe` subcommand; finds the
                        wrapper on PATH or via $VOX_PUNCT, and always sets
                        VOX_NO_HISTORY=1 — a batch job is not dictation.
+                       The `hermes-` prefix names nothing in this project
+                       and appears nowhere else in it — read it as
+                       "transcribe a file with voxtype" and ignore the
+                       prefix. Nothing else here depends on this script.
 config/README.md       per-file copy instructions for everything below
 config/config.toml.example       voxtype's own config, annotated
 config/llm.conf.example          where the qwen stage sends your text

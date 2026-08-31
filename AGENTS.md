@@ -1,8 +1,10 @@
 # Instructions for a coding agent installing this repo
 
 You are reading this because someone handed you this repository and asked you to
-set it up. This file is the script for that conversation. `CLAUDE.md` is a
-symlink to this file.
+set it up. This file is the script for that conversation. `CLAUDE.md` is a real file
+that points here rather than a symlink to it, because `omarchy plugin validate`
+rejects any symlink inside a plugin folder and this repo is checked out directly
+as one.
 
 This repo adds two things to **voxtype** (a third-party push-to-talk dictation
 tool, https://voxtype.io — it is NOT part of this repo and must be installed
@@ -26,11 +28,18 @@ files before you have answers to Q1, Q2 and Q3.
 
 | Answer | What you configure | What they need |
 |---|---|---|
-| **A. Nowhere — just fix obvious typos** | pipeline `sed`, no LLM at all | nothing else |
+| **A. Nowhere — just fix obvious typos** | pipeline `sed`, no LLM at all | nothing else, but see below |
 | **B. On this machine** | ollama on localhost | a GPU with ~10 GB VRAM, or patience |
 | **C. On another machine I have access to** | `LLM_URL` pointing at that host | the host's address, and that host reachable |
 | **D. A paid API (OpenAI-compatible)** | `LLM_URL` + `LLM_KEY_FILE` | an API key |
 | **E. Google Gemini** | the `gemini` stage | a Gemini API key |
+
+**If they pick A, say the quiet part.** The `sed` stage has no rules by default,
+so pipeline `sed` alone changes nothing at all — it is a working pipeline that
+does no work. Start them off rather than leaving them puzzled:
+`cp config/polish-sed.example.sed ~/.config/voxtype/polish-sed.sed`, then add one
+`s/\bwrong\b/right/g` line per mistake they see their transcription make. A
+punctuates nothing either — only an LLM stage inserts punctuation.
 
 B, C, D and E all cost latency; A is instant and fully offline. C is the common
 case for someone without a GPU who has a friend with one. Note for C and D: the
@@ -79,6 +88,20 @@ $EDITOR ~/.config/voxtype/llm.key      # paste the key, nothing else, no quotes
 any file inside this repo. Never echo a key into your own transcript, and never
 read one back to confirm it — check it with `test -s`, not by printing it.
 
+## Check voxtype itself first
+
+This repo post-processes voxtype's output; it cannot make voxtype work. Before
+installing anything, confirm the thing underneath is alive:
+
+```bash
+voxtype setup check                    # model present, backend usable
+systemctl --user is-active voxtype     # -> active
+```
+
+If either fails, stop: that is voxtype's setup, not this repo's. README.md steps
+1, 2 and 4 walk through it, and the daemon's unit comes from
+`voxtype setup systemd`, which nothing here creates.
+
 ## Then install
 
 `./install --dry-run` first, show the user what it will do, then `./install`.
@@ -86,9 +109,27 @@ It is idempotent, backs up anything it would overwrite, and never touches
 `shell.json` or any key file. Read `README.md` for what it deliberately leaves
 for a human.
 
+Note that `install` links the bar plugin unconditionally — it has no flag to skip
+that step. On a machine with no Omarchy the symlink it creates is inert and
+harmless; if the user would rather not have it, remove it afterwards with
+`rm ~/.config/omarchy/plugins/local.voxtype`.
+
 After it runs, write `~/.config/voxtype/llm.conf` from `config/llm.conf.example`
 according to the Q1 answer, and `~/.config/voxtype/polish-mode` according to the
-pipeline you agreed on:
+pipeline you agreed on.
+
+**`LLM_MODEL` is the one key you must get right**, because getting it wrong fails
+silently — the endpoint 404s, the stage counts as failed, and the dictation comes
+back merely unpunctuated. It has to name a model the endpoint actually serves:
+
+| Q1 | `LLM_MODEL` |
+|---|---|
+| B | build it first: `ollama pull qwen2.5:7b && ollama create vp-qwen7 -f config/vp-qwen.Modelfile`, then `vp-qwen7`. Or skip the build and point at `qwen2.5:7b` directly — `LLM_SEND_SYSTEM` defaults to 1, so a stock model works |
+| C | whatever that host serves. Ask, or run `curl -s http://HOST:11434/api/tags \| jq -r '.models[].name'` |
+| D | the vendor's model id |
+
+The shipped `llm.conf.example` says `vp-qwen7`, which exists only on a machine
+that ran the `ollama create` above. For C and D you must change it.
 
 | Q1 answer | polish-mode |
 |---|---|
@@ -125,7 +166,11 @@ actually dictate something. Nothing is verified until text lands in a real windo
 
 - Do not edit anything under `~/.config/omarchy/` other than creating the plugin
   symlink. `shell.json` in particular is Omarchy's own file and a bad edit breaks
-  the user's bar. If the plugin needs enabling, use `omarchy plugin enable`.
+  the user's bar. If the plugin needs enabling, run `omarchy-shell shell rescanPlugins` FIRST and
+  then `omarchy plugin enable local.voxtype`. The rescan is not optional:
+  `enable` resolves the id against the running shell's registry, which was built
+  at shell startup and has never seen the symlink you just created — without it
+  you get `omarchy-plugin-enable: plugin 'local.voxtype' is not known`.
 - Do not rewrite the Brazilian-Portuguese comments in the QML and in
   `bin/voxtype-punct`. They are the author's and they are load-bearing
   documentation of why each guard exists.
