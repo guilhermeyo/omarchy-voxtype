@@ -18,6 +18,43 @@ separately):
 The bar plugin only makes sense on Omarchy. The post-processor works on any
 Linux box running voxtype, with no bar at all.
 
+## The two layers — get this straight before you touch anything
+
+Dictation here is two stacked systems, built by different people, failing
+independently. Most bad installs come from treating them as one.
+
+```
+  LAYER 1 — voxtype. NOT this repo. Install and verify it first.
+  voice ──► speech recognition (local, or a remote API) ──► raw text
+
+  LAYER 2 — this repo.
+  raw text ──► voxtype-punct ──► sed / an LLM / Gemini ──► punctuated text
+```
+
+Layer 1 is speech recognition; layer 2 is a language model. They never see the
+same thing: layer 1 receives **audio**, layer 2 receives only the **text** layer
+1 produced. A polish stage never hears the user's voice. Say this out loud when
+both are remote — it is two vendors, two payloads, usually two API keys.
+
+**Order of work, and do not deviate:**
+
+1. Confirm layer 1 already works. Have them dictate into a text editor and watch
+   for words. Unpunctuated words are SUCCESS at this stage.
+   `voxtype setup check` and `systemctl --user is-active voxtype` back it up.
+   If no text appears, stop. That is voxtype's problem, not this repo's, and
+   nothing here runs until voxtype produces text to run on. Point them at
+   voxtype's own docs rather than installing anything from here.
+2. Only then install layer 2: `./install`, a key if their answers need one, and
+   one line in `polish-mode`.
+3. Verify layer 2 changed the output, not that it merely ran.
+
+The coupling is deliberately loose, and you should tell them so: if layer 2
+breaks — expired key, endpoint down, no network — dictation keeps working and
+comes back raw. Every stage that fails leaves the previous text untouched, so
+the worst outcome is unpolished text, never lost text. `echo off >
+~/.config/voxtype/polish-mode`, or one click in the bar widget, disables layer 2
+without touching voxtype's config.
+
 ## Do not guess. Ask these questions first.
 
 Ask them in the user's own language. Ask them one at a time if the user seems
@@ -127,18 +164,22 @@ $EDITOR ~/.config/voxtype/llm.key      # paste the key, nothing else, no quotes
 any file inside this repo. Never echo a key into your own transcript, and never
 read one back to confirm it — check it with `test -s`, not by printing it.
 
-## Check voxtype itself first
+## Confirm layer 1 before you install layer 2
 
-This repo post-processes voxtype's output; it cannot make voxtype work. Before
-installing anything, confirm the thing underneath is alive:
+Step 1 of "The two layers" above, executed. This repo post-processes voxtype's
+output; it cannot make voxtype work.
 
 ```bash
 voxtype setup check                    # model present, backend usable
 systemctl --user is-active voxtype     # -> active
 ```
 
-If either fails, stop: that is voxtype's setup, not this repo's. README.md steps
-1, 2 and 4 walk through it, and the daemon's unit comes from
+Then have them dictate one sentence into a text editor and confirm words appear.
+The two commands can both pass while dictation still produces nothing, so the
+sentence is the real test, not the commands.
+
+If any of that fails, stop and install nothing. README.md steps 1, 2 and 4 walk
+through voxtype's own setup, and the daemon's unit comes from
 `voxtype setup systemd`, which nothing here creates.
 
 ## Then install

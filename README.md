@@ -34,6 +34,49 @@ Prefer to do it yourself? `./install --dry-run` shows you every change first,
 then `./install` makes them. Or read [Install from scratch](#install-from-scratch)
 and do it by hand. Every path ends in the same place.
 
+## Two layers, and you install them in that order
+
+Dictation here is two separate things stacked. They are built by different
+people, they fail independently, and confusing them is the fastest way to waste
+an afternoon.
+
+```
+  LAYER 1 — voxtype, not this repo
+  your voice ──► speech recognition ──► raw text, no punctuation
+                 local, or a remote API
+
+  LAYER 2 — this repo
+  raw text ──► voxtype-punct ──► sed / your LLM / Gemini ──► punctuated text ──► pasted
+```
+
+**Layer 1 is speech recognition. Layer 2 is a language model.** They are not the
+same service and they never see the same thing: layer 1 receives *audio*, layer 2
+receives only the *text* layer 1 produced. A polish stage never hears your voice.
+When both are remote, that is two vendors seeing your dictation in two different
+forms, and usually two separate API keys:
+
+| | what leaves the machine | where the key goes |
+|---|---|---|
+| Layer 1, `[whisper] mode = "remote"` | the audio | `remote_api_key` in `config.toml` |
+| Layer 2, a `gemini` stage | the transcribed text | `~/.config/voxtype/gemini.key` |
+| Layer 2, a `qwen` stage on someone else's box | the transcribed text | `LLM_KEY_FILE` in `llm.conf`, if that endpoint wants one |
+| Layer 2, `sed` only | nothing | none |
+
+**Get layer 1 working alone first.** Configure voxtype, dictate into a text
+editor, and confirm words appear. They will be unpunctuated and that is correct
+at this stage. If nothing appears, the problem is voxtype and this repo cannot
+help you — nothing here runs until voxtype produces text to run on.
+
+**Then add layer 2**, which is `./install` plus a key plus one line in
+`polish-mode`. Punctuation starts appearing; nothing about layer 1 changes.
+
+The stacking is deliberately loose. If layer 2 breaks — expired key, endpoint
+down, no network — dictation keeps working and simply comes back raw. Every
+stage that fails leaves the previous text untouched, so the worst outcome is
+unpolished text, never lost text. You can also turn layer 2 off entirely from
+the bar widget, or with `echo off > ~/.config/voxtype/polish-mode`, without
+touching voxtype's config at all.
+
 ## Not enough machine to transcribe on?
 
 Everything below assumes your machine can run the speech recognition itself.
