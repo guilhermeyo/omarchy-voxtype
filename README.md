@@ -734,11 +734,12 @@ printf '[Service]\nEnvironment="OLLAMA_KEEP_ALIVE=-1"\n' | \
 sudo systemctl daemon-reload && sudo systemctl restart ollama
 ```
 
-The reference machine also sets `OLLAMA_HOST=0.0.0.0:11434`, so that other
-machines can use it as their `LLM_URL`. **Do not copy that by reflex** — plain
-ollama has no authentication, so binding it to every interface exposes an
-unauthenticated LLM to your whole LAN. Only on a network you trust, or behind a
-VPN.
+To let *other* machines point their `LLM_URL` at this one, ollama also has to
+listen on more than loopback — `OLLAMA_HOST=0.0.0.0:11434` in the same drop-in.
+**Do not add that by reflex.** Plain ollama has no authentication, so binding it
+to every interface hands an unauthenticated LLM to everything that can reach the
+box. Only on a network you trust, or behind a VPN, and only if you actually need
+the remote case.
 
 **Verify:**
 
