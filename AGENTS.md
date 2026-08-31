@@ -48,21 +48,26 @@ let them find out later.
 
 **Q1b — Can this machine actually transcribe? Check, do not assume.**
 
-Ask this BEFORE anything else if the hardware sounds old, and run the check
-either way. It decides whether the rest of the install is even possible.
+Run the check even when the hardware sounds fine. Measure; do not reason from
+the CPU model.
 
 ```bash
-grep -o avx2 /proc/cpuinfo | head -1     # empty = no AVX2 = packaged binaries will not run
-voxtype info variants                     # read "Recommended for this hardware"
+voxtype --version                        # "Illegal instruction" = this build will not run here
+grep -o avx2 /proc/cpuinfo | head -1     # empty = no AVX2, expect slow local inference
+voxtype info variants                    # read "Recommended for this hardware"
 ```
 
-voxtype ships AVX2 and AVX-512 builds; the `native` variants are not installed.
-A pre-Haswell CPU (2013) has no AVX2 — a ThinkPad X220 and its generation cannot
-run them, and their integrated GPUs are too old for the Vulkan path. This is not
-a slow setup, it is one that does not start.
+The binaries are named for their instruction set (`voxtype-avx2`, the AVX-512
+pair; the `native` variants are not installed), which makes a pre-Haswell CPU
+look unsupported. It usually is not: the inference code dispatches on CPU
+features at runtime, and a 2011 Sandy Bridge ThinkPad X220 launches these
+binaries fine. What an old machine loses is throughput, not the ability to start.
 
-If the machine cannot transcribe locally, do NOT walk them through downloading
-a Parakeet or Whisper model. Configure remote transcription instead:
+So the decision rule is about speed, not support. If it launches, have them time
+a real transcription (`time voxtype transcribe clip.wav` on a ten-second clip)
+and ask whether they will accept that wait after every sentence. If it does not
+launch, or the wait is unacceptable, do NOT walk them through downloading a
+Parakeet or Whisper model. Configure remote transcription instead:
 
 ```toml
 [whisper]

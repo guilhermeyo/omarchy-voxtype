@@ -34,26 +34,36 @@ Prefer to do it yourself? `./install --dry-run` shows you every change first,
 then `./install` makes them. Or read [Install from scratch](#install-from-scratch)
 and do it by hand. Every path ends in the same place.
 
-## No hardware to transcribe with?
+## Not enough machine to transcribe on?
 
 Everything below assumes your machine can run the speech recognition itself.
-Plenty of machines cannot, and the failure is not "slow" — it is "does not
-start". The binaries voxtype ships are built for **AVX2 or AVX-512**
-(`voxtype-avx2`, `voxtype-onnx-avx2`, and the AVX-512 pair); the `native`
-variants are listed as *not installed*. A CPU older than Haswell (2013) has no
-AVX2, so a ThinkPad X220 or anything of that generation cannot run the packaged
-binaries at all, and its integrated GPU is too old for the Vulkan path.
+Plenty of machines cannot do it *usefully*, and you should find out which side
+of that line you are on before planning anything else.
 
-Check before you plan anything:
+The binaries voxtype ships are named for their instruction set —
+`voxtype-avx2`, `voxtype-onnx-avx2` and the AVX-512 pair; the `native` variants
+are listed as *not installed*. A CPU older than Haswell (2013) has no AVX2, so
+that naming looks fatal. In practice it is not: a 2011 Sandy Bridge ThinkPad
+X220 runs these binaries fine, because the inference code dispatches on CPU
+features at runtime rather than requiring them to start. What such a machine
+loses is speed, not the ability to launch.
+
+So measure, do not infer:
 
 ```bash
-grep -o avx2 /proc/cpuinfo | head -1     # empty = no AVX2
-voxtype info variants                     # "Recommended for this hardware"
+voxtype --version                        # "Illegal instruction" = this build will not run here
+grep -o avx2 /proc/cpuinfo | head -1     # empty = no AVX2, expect slow local inference
+voxtype info variants                    # "Recommended for this hardware"
+time voxtype transcribe some-10s-clip.wav   # the number that actually decides it
 ```
+
+If it launches but a ten-second clip takes longer than you are willing to wait
+after every sentence, the problem is throughput, and the fix below is the same
+one as for a machine that cannot launch at all.
 
 **voxtype can send the audio somewhere else.** This is a voxtype feature, not
 something this repo adds, and it means an old laptop only has to record and
-paste:
+paste — no local model, no download, no waiting on the CPU:
 
 ```toml
 [whisper]
