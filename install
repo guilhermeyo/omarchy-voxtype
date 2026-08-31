@@ -1,0 +1,784 @@
+#!/usr/bin/env bash
+#
+# omarchy-voxtype installer.
+#
+# Idempotent: run it as many times as you like. Every step reports one of
+#
+#   OK    the step changed something and succeeded
+#   SKIP  the step was already satisfied, nothing was touched
+#   WARN  something needs your attention, but the install can continue
+#   NEED  a package YOU still have to install; nothing this script can fix
+#   FAIL  something is missing or unsafe to fix automatically
+#
+# Exit codes:
+#   0  the install did its job (NEED and WARN lines may still be printed --
+#      "you have not installed voxtype yet" is not an installer failure)
+#   1  at least one step reported FAIL
+#   2  bad usage
+#
+# No mutation is allowed to abort the run: a write that fails becomes a FAIL
+# line and the remaining steps still execute, so the Summary is always printed.
+#
+# What it deliberately does NOT do:
+#   * install packages (it only tells you what is missing)
+#   * touch ~/.config/voxtype/gemini.key -- your API key is yours
+#   * write into ~/.config/omarchy/shell.json -- that is Omarchy's file and a
+#     bad edit there breaks the whole bar; enabling the plugin is a printed step
+#   * overwrite a config.toml that already wires up a post-processor
+#   * install a sed rules file (see step 4: no rules is the correct default)
+#
+set -euo pipefail
+
+# --------------------------------------------------------------------------
+# Paths. Everything hangs off $HOME / the XDG vars so the script can be tested
+# against a scratch HOME without ever touching the real one.
+#
+# These MUST stay identical to the paths bin/voxtype-punct resolves at runtime:
+#   config:  ${XDG_CONFIG_HOME:-$HOME/.config}/voxtype
+#   history: ${XDG_STATE_HOME:-$HOME/.local/state}/voxtype/history.jsonl
+# If the two ever disagree the installer writes polish-mode and
+# polish-prompt.txt into a directory the wrapper never opens, and every
+# dictation silently falls back to the defaults with no error anywhere.
+# --------------------------------------------------------------------------
+SRC="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+XDG_CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}"
+XDG_STATE="${XDG_STATE_HOME:-$HOME/.local/state}"
+BIN_DIR="$HOME/.local/bin"
+VOX_CFG="$XDG_CONFIG/voxtype"
+VOX_STATE="$XDG_STATE/voxtype"
+HIST_FILE="$VOX_STATE/history.jsonl"
+PLUGIN_DIR="$XDG_CONFIG/omarchy/plugins"
+PLUGIN_LINK="$PLUGIN_DIR/local.voxtype"
+WRAPPER="$BIN_DIR/voxtype-punct"
+# The same path as a TOML *basic* string. A pathname may legally contain a
+# backslash or a double quote, and both are escape characters inside "..." --
+# writing one through unescaped produces a config.toml that does not parse.
+WRAPPER_TOML="${WRAPPER//\\/\\\\}"
+WRAPPER_TOML="${WRAPPER_TOML//\"/\\\"}"
+
+# One timestamp for the whole run, so every backup this run makes shares a
+# suffix and you can tell at a glance which files one install touched.
+EPOCH="$(date +%s)"
+
+DRY_RUN=0
+# MISSING_N is deliberately NOT part of FAIL_N: "you have not run pacman yet"
+# is a fact about the machine, not a step this installer got wrong. Counting it
+# as a failure made a perfectly good install exit 1.
+OK_N=0; SKIP_N=0; WARN_N=0; FAIL_N=0; MISSING_N=0
+
+# --------------------------------------------------------------------------
+# Output helpers
+# --------------------------------------------------------------------------
+if [ -t 1 ]; then
+  C_OK=$'\033[32m'; C_SKIP=$'\033[2m'; C_WARN=$'\033[33m'; C_FAIL=$'\033[31m'
+  C_HEAD=$'\033[1m'; C_OFF=$'\033[0m'
+else
+  C_OK=""; C_SKIP=""; C_WARN=""; C_FAIL=""; C_HEAD=""; C_OFF=""
+fi
+
+step()  { printf '\n%s==> %s%s\n' "$C_HEAD" "$*" "$C_OFF"; }
+ok()    { OK_N=$((OK_N+1));     printf '    %sOK%s    %s\n'   "$C_OK"   "$C_OFF" "$*"; }
+skip()  { SKIP_N=$((SKIP_N+1)); printf '    %sSKIP%s  %s\n'   "$C_SKIP" "$C_OFF" "$*"; }
+warn()  { WARN_N=$((WARN_N+1)); printf '    %sWARN%s  %s\n'   "$C_WARN" "$C_OFF" "$*"; }
+fail()  { FAIL_N=$((FAIL_N+1)); printf '    %sFAIL%s  %s\n'   "$C_FAIL" "$C_OFF" "$*"; }
+need()  { MISSING_N=$((MISSING_N+1)); printf '    %sNEED%s  %s\n' "$C_FAIL" "$C_OFF" "$*"; }
+note()  { if [ -z "${1-}" ]; then printf '\n'; else printf '          %s\n' "$*"; fi; }
+
+# An OK line must not claim in a dry run that something happened. The
+# [dry-run] line printed just above it already shows the exact command.
+would() { if [ "$DRY_RUN" -eq 1 ]; then printf 'would be %s' "$1"; else printf '%s' "$1"; fi; }
+
+# run <command...> -- the single choke point for every mutation. In --dry-run
+# nothing below this line ever executes, so a dry run cannot create a
+# directory, a backup or a symlink by accident.
+#
+# It returns the command's own exit status, and every caller tests it, so a
+# write that fails turns into a FAIL line instead of aborting the script
+# through `set -e` with no summary. In --dry-run it always succeeds.
+run() {
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf '          %s[dry-run]%s %s\n' "$C_SKIP" "$C_OFF" "$*"
+    return 0
+  fi
+  "$@"
+}
+
+usage() {
+  cat <<EOF
+omarchy-voxtype installer
+
+Usage: ./install [--dry-run] [--help]
+
+  --dry-run, -n   Print exactly what would change and change nothing.
+  --help, -h      Show this help.
+
+Installs, from this repo (paths follow XDG_CONFIG_HOME / XDG_STATE_HOME, as
+the wrapper itself does):
+  bin/voxtype-punct              -> $WRAPPER
+  bin/hermes-voxtype-transcribe  -> $BIN_DIR/hermes-voxtype-transcribe
+  config/polish-prompt.txt       -> $VOX_CFG/polish-prompt.txt
+  a default $VOX_CFG/polish-mode  (offline "sed", if absent)
+  the [output.post_process] stanza in $VOX_CFG/config.toml
+  this repo, symlinked to $PLUGIN_LINK
+
+It never installs packages, never touches $VOX_CFG/gemini.key, and
+never writes into $XDG_CONFIG/omarchy/shell.json.
+
+Existing files are never silently clobbered: a destination that differs from
+the repo copy is backed up to <file>.bak.<epoch> first, and config.toml and
+polish-prompt.txt are not overwritten at all once you have customised them.
+
+Exits 0 when the install did its job (missing packages are reported as NEED
+and do not change that), 1 if any step reported FAIL, 2 on a bad option.
+EOF
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --dry-run|-n) DRY_RUN=1 ;;
+    --help|-h)    usage; exit 0 ;;
+    *) printf 'install: unknown option: %s\n\n' "$1" >&2; usage >&2; exit 2 ;;
+  esac
+  shift
+done
+
+printf '%somarchy-voxtype installer%s\n' "$C_HEAD" "$C_OFF"
+printf 'repo:   %s\n' "$SRC"
+printf 'target: HOME=%s\n' "$HOME"
+[ "$DRY_RUN" -eq 1 ] && printf '%sDRY RUN -- nothing will be changed.%s\n' "$C_WARN" "$C_OFF"
+
+# --------------------------------------------------------------------------
+# install_file <src> <dst> <mode>
+#
+# The "refuse to clobber" rule. Three outcomes:
+#   dst missing        -> install it
+#   dst identical      -> SKIP, do not even touch the mtime
+#   dst differs        -> back it up to dst.bak.$EPOCH, THEN overwrite
+#
+# The backup exists because the destination may be a version the user edited
+# by hand (the live wrapper on this machine started life that way). Losing a
+# hand-tuned post-processor to a re-run of the installer is exactly the
+# failure this guard prevents.
+# --------------------------------------------------------------------------
+install_file() {
+  local src="$1" dst="$2" mode="$3" label="$4"
+  if [ ! -e "$dst" ]; then
+    if run install -D -m "$mode" -- "$src" "$dst"; then
+      ok "$label $(would installed) -> $dst"
+    else
+      fail "could not write $dst -- $label NOT installed"
+      note "check the permissions on $(dirname -- "$dst")"
+    fi
+  elif cmp -s -- "$src" "$dst"; then
+    skip "$label already up to date ($dst)"
+  else
+    # No backup, no overwrite. Clobbering a hand-tuned file and then failing
+    # to keep the copy would be the one unrecoverable outcome here.
+    if ! run cp -p -- "$dst" "$dst.bak.$EPOCH"; then
+      fail "could not back up $dst -- left untouched"
+      return 0
+    fi
+    if run install -D -m "$mode" -- "$src" "$dst"; then
+      ok "$label $(would updated) -> $dst"
+      note "previous version saved as $dst.bak.$EPOCH"
+    else
+      fail "could not write $dst -- $label left at the previous version"
+      note "a backup was still made: $dst.bak.$EPOCH"
+    fi
+  fi
+}
+
+# ==========================================================================
+step "1/8  Preflight -- checking for the commands this setup needs"
+# Nothing is installed here on purpose: this repo targets Arch/Omarchy but the
+# wrapper itself is portable, and silently pulling packages onto someone's
+# machine is not the installer's business.
+# ==========================================================================
+missing_hard=()
+# wl-copy is required, not optional: it is how the bar plugin's history window
+# copies an entry back out, and how voxtype itself delivers text when
+# config.toml uses output mode "clipboard" instead of "type".
+for c in voxtype jq curl sed wl-copy; do
+  if command -v "$c" >/dev/null 2>&1; then
+    ok "$c found ($(command -v "$c"))"
+  else
+    # command name != package name for two of these
+    case "$c" in
+      voxtype) missing_hard+=("voxtype-bin") ;;
+      wl-copy) missing_hard+=("wl-clipboard") ;;
+      *)       missing_hard+=("$c") ;;
+    esac
+    # NEED, not FAIL: the installer can still do every one of its own jobs.
+    need "$c NOT found -- required at runtime"
+  fi
+done
+
+# GNU sed specifically: the opt-in rules files use \b, \x01 and the s///I flag,
+# none of which are POSIX or BSD sed. On BSD sed the rules silently do nothing
+# or abort, which looks exactly like "the polish stage stopped working".
+if command -v sed >/dev/null 2>&1; then
+  if sed --version 2>/dev/null | head -n1 | grep -qi gnu; then
+    ok "sed is GNU sed"
+  else
+    warn "sed is not GNU sed -- the shipped sed rule examples will not work"
+    note "they use \\b, \\x01 and s///I, which are GNU extensions"
+  fi
+fi
+
+have_ollama=0
+missing_soft=()
+for c in ollama omarchy ffmpeg python3; do
+  if command -v "$c" >/dev/null 2>&1; then
+    ok "$c found ($(command -v "$c"))"
+    if [ "$c" = ollama ]; then have_ollama=1; fi
+  else
+    # None of these are fatal: without ollama the local LLM stage is
+    # unavailable but sed and gemini still run; without omarchy you simply
+    # have no bar plugin, and the dictation pipeline does not depend on the
+    # plugin at all; ffmpeg and python3 are used only by the batch
+    # transcribe helper, never by live dictation.
+    missing_soft+=("$c")
+    warn "$c NOT found -- optional"
+    case "$c" in
+      ollama)  note "the 'qwen' (local LLM) stage will be unavailable; sed and gemini still work" ;;
+      omarchy) note "the bar plugin and history window will be unavailable; dictation still works" ;;
+      ffmpeg)  note "only hermes-voxtype-transcribe (batch transcription of audio files) needs it" ;;
+      python3) note "only hermes-voxtype-transcribe needs it; the installer also uses it, when" ;
+               note "present, to check that the config.toml it writes still parses as TOML" ;;
+    esac
+  fi
+done
+
+if [ "${#missing_hard[@]}" -gt 0 ]; then
+  note "install the missing required commands, e.g.:"
+  note "  sudo pacman -S ${missing_hard[*]}"
+  note "(continuing anyway so the rest of the install is still done)"
+fi
+if [ "${#missing_soft[@]}" -gt 0 ]; then
+  note "optional extras, install only the ones you want:"
+  note "  sudo pacman -S ${missing_soft[*]}"
+fi
+
+# ==========================================================================
+step "2/8  Wrapper scripts -> $BIN_DIR"
+# ==========================================================================
+# Remember whether we are REPLACING an older wrapper rather than installing
+# fresh. It matters in step 4: older versions of voxtype-punct had the
+# Portuguese sed rules hardcoded, so upgrading turns the sed stage into a
+# pass-through unless the user opts back in with a rules file. That change is
+# silent -- text simply stops being corrected -- so it has to be announced.
+wrapper_replaced=0
+if [ -e "$WRAPPER" ] && ! cmp -s -- "$SRC/bin/voxtype-punct" "$WRAPPER"; then
+  wrapper_replaced=1
+fi
+install_file "$SRC/bin/voxtype-punct" "$WRAPPER" 755 "voxtype-punct"
+install_file "$SRC/bin/hermes-voxtype-transcribe" \
+             "$BIN_DIR/hermes-voxtype-transcribe" 755 "hermes-voxtype-transcribe"
+
+# voxtype itself calls the wrapper by ABSOLUTE path from config.toml, so PATH
+# does not matter for dictation. It matters for the batch-transcribe helper and
+# for running the wrapper by hand to debug it.
+case ":${PATH-}:" in
+  *":$BIN_DIR:"*) ok "$BIN_DIR is on PATH" ;;
+  *)
+    warn "$BIN_DIR is NOT on your PATH"
+    note "dictation still works (config.toml calls the wrapper by absolute path),"
+    note "but you cannot run 'voxtype-punct' or 'hermes-voxtype-transcribe' by name."
+    note "add to your shell rc:  export PATH=\"\$HOME/.local/bin:\$PATH\""
+    ;;
+esac
+
+# ==========================================================================
+step "3/8  Polish prompt -> $VOX_CFG/polish-prompt.txt"
+# Unlike the wrapper, a differing prompt is NEVER overwritten, not even with a
+# backup. The prompt is the one file users are expected to tune for their own
+# voice, and quietly replacing it changes how every future dictation reads.
+# ==========================================================================
+prompt_dst="$VOX_CFG/polish-prompt.txt"
+if [ ! -e "$prompt_dst" ]; then
+  if run install -D -m 644 -- "$SRC/config/polish-prompt.txt" "$prompt_dst"; then
+    ok "polish-prompt.txt $(would installed) -> $prompt_dst"
+    note "language-agnostic by design: it tells the model to answer in the input's"
+    note "own language and never to translate."
+  else
+    fail "could not write $prompt_dst"
+    note "without it the gemini stage aborts before every request"
+  fi
+elif cmp -s -- "$SRC/config/polish-prompt.txt" "$prompt_dst"; then
+  skip "polish-prompt.txt already up to date"
+else
+  warn "polish-prompt.txt exists and differs -- left untouched"
+  note "your tuned prompt is kept. to compare against the shipped one:"
+  note "  diff -u $prompt_dst $SRC/config/polish-prompt.txt"
+fi
+
+# A worked example, not a default. Mentioned, never installed.
+if [ -e "$SRC/config/polish-prompt.pt-BR.txt" ]; then
+  note "optional Brazilian-Portuguese prompt (opt in by hand):"
+  note "  cp $SRC/config/polish-prompt.pt-BR.txt $prompt_dst"
+fi
+
+# ==========================================================================
+step "4/8  sed rules -- intentionally NOT installed"
+# The sed stage rewrites text deterministically, before any LLM sees it. The
+# only rules that exist in this repo are one user's Brazilian-Portuguese ASR
+# fixes, and two of them ("and" -> "e", "for example" -> "por exemplo")
+# translate English into Portuguese unconditionally. Shipping those as a
+# default would silently corrupt anyone else's dictation, with no error and no
+# way to notice except by rereading the text. So the default is NO rules file,
+# which makes the sed stage a pass-through.
+# ==========================================================================
+sed_dst="$VOX_CFG/polish-sed.sed"
+if [ -e "$sed_dst" ]; then
+  skip "$sed_dst exists -- the sed stage will use it (not modified)"
+else
+  ok "no rules file at $sed_dst -- sed stage is a safe pass-through"
+fi
+note ""
+note "The sed stage does nothing until you give it rules. That is deliberate:"
+note "rules are language-specific and a wrong rule corrupts text silently."
+note ""
+note "To opt into the Brazilian-Portuguese rules (note: they rewrite English"
+note "words into Portuguese -- do not use them if you dictate in English):"
+note "  cp $SRC/config/polish-sed.pt-BR.sed $sed_dst"
+note ""
+note "To start your own from a neutral, language-safe template:"
+note "  cp $SRC/config/polish-sed.example.sed $sed_dst"
+note ""
+note "Or point at a file anywhere:  export VOX_SED_RULES=/path/to/rules.sed"
+if [ "$wrapper_replaced" -eq 1 ] && [ ! -e "$sed_dst" ]; then
+  note ""
+  warn "you just replaced an older voxtype-punct that had its sed rules built in"
+  note "your sed stage is now a pass-through. to keep the old behaviour exactly:"
+  note "  cp $SRC/config/polish-sed.pt-BR.sed $sed_dst"
+  note "the previous wrapper is at $WRAPPER.bak.$EPOCH if you want to diff the rules."
+fi
+
+# ==========================================================================
+step "5/8  Default pipeline -> $VOX_CFG/polish-mode"
+# The default is "sed": one offline, local, no-op-without-rules stage. It is
+# never "auto" or anything containing "gemini", because that would ship every
+# word the user dictates to a third party without them ever agreeing to it.
+# ==========================================================================
+mode_dst="$VOX_CFG/polish-mode"
+if [ -e "$mode_dst" ]; then
+  cur="$(head -n1 -- "$mode_dst" 2>/dev/null || true)"
+  skip "polish-mode exists -- current pipeline: '${cur:-<empty>}'"
+elif ! run install -D -m 644 /dev/null "$mode_dst"; then
+  fail "could not write $mode_dst"
+  note "the wrapper will fall back to its built-in default pipeline"
+elif [ "$DRY_RUN" -eq 1 ]; then
+  printf '          %s[dry-run]%s write "sed" to %s\n' "$C_SKIP" "$C_OFF" "$mode_dst"
+  ok "polish-mode would be created with the offline default: sed"
+elif printf 'sed\n' > "$mode_dst"; then
+  ok "polish-mode created with the offline default: sed"
+else
+  fail "could not write $mode_dst"
+fi
+note ""
+note "The pipeline is stages joined by '+', in execution order. A '?' prefix"
+note "means 'only run this step if the step above it failed'."
+note "  sed                    offline only (the default; no-op without rules)"
+note "  sed+qwen               local LLM via ollama, nothing leaves the machine"
+note "  sed+qwen+?gemini       local LLM, cloud ONLY if the local one went quiet"
+note "  sed+gemini             cloud on every dictation"
+note "  off                    no post-processing at all"
+note ""
+note "!! Any pipeline containing 'gemini' sends the full text of every dictation"
+note "!! to Google. This installer will never enable it for you."
+note ""
+note "Change it with:  echo 'sed+qwen' > $mode_dst"
+note "or from the bar plugin panel, which edits the same file."
+if [ "$have_ollama" -eq 1 ]; then
+  # Said plainly rather than left in the list above: with the default 'sed' and
+  # no rules file the pipeline does nothing at all, and this machine already
+  # has the one dependency needed to make it do something without sending a
+  # single word off the machine.
+  note ""
+  note "ollama is installed on this machine, so the local-LLM pipeline is one"
+  note "command away (nothing leaves the machine, no API key, no account):"
+  note "  echo 'sed+qwen' > $mode_dst"
+  note "it needs the vp-qwen7 model -- see step 2 of the manual steps below."
+fi
+
+# ==========================================================================
+step "6/8  Wire the post-processor into $VOX_CFG/config.toml"
+# voxtype needs an ABSOLUTE path here (no ~ / $HOME expansion), and on ANY
+# post-process failure -- including "command not found" -- it silently falls
+# back to the raw transcript. A typo here therefore produces no error at all,
+# just dictation that quietly stops being polished. That is why this step
+# writes the resolved path itself instead of asking you to edit a placeholder.
+# ==========================================================================
+cfg="$VOX_CFG/config.toml"
+STANZA="$(cat <<EOF
+
+[output.post_process]
+# Absolute path required: voxtype does not expand ~ or \$HOME here, and on ANY
+# failure it SILENTLY falls back to the raw transcript -- a wrong path produces
+# no error, just unpolished dictation.
+command = "$WRAPPER_TOML"
+# Worst case measured for "sed+qwen+?gemini" on the reference machine: local 4s
+# + gemini 15s (or gemini failing fast plus a 15s retry) ~= 19.5s, plus spawn
+# and jq margin. Exceeding this timeout DISCARDS the whole post-process (sed
+# included) and types the raw transcript, so on slower hardware raise it --
+# lowering it only loses polish.
+timeout_ms = 35000
+EOF
+)"
+
+# Does the config already declare the post-process table, in any of the forms
+# TOML allows? These matchers are deliberately loose, and asymmetrically so: a
+# false positive costs one printed instruction, while a false negative appends
+# a SECOND [output.post_process] table -- a duplicate-key error that stops
+# voxtype from parsing the config at all. "Do nothing" is the safe direction.
+#
+# Matches "[output.post_process]", "[ output . post_process ]",
+# ["output"."post_process"], with or without a trailing comment. Does NOT match
+# a commented-out header, which the shipped example also contains.
+has_pp_header() {
+  grep -qE '^[[:space:]]*\[[[:space:]]*"?output"?[[:space:]]*\.[[:space:]]*"?post_process"?[[:space:]]*\]' -- "$1"
+}
+# The dotted and inline-table spellings: post_process = { command = ... },
+# post_process.command = ..., output.post_process = { ... }.
+has_pp_key() {
+  grep -qE '^[[:space:]]*("?output"?[[:space:]]*\.[[:space:]]*)?"?post_process"?[[:space:]]*[.=]' -- "$1"
+}
+has_pp() { has_pp_header "$1" || has_pp_key "$1"; }
+
+# The value of an uncommented `command` key belonging to that table, in either
+# TOML string form -- basic "..." AND literal '...' -- and in either the table
+# or the dotted spelling. Empty when there is no key it can recognise, which
+# the caller must treat as "I do not know", never as "there is none".
+# Written in bash rather than sed so quotes need no escaping gymnastics.
+pp_command_value() {
+  local sq=\' line in_table=0 hdr_re val_re dot_re
+  hdr_re='^[[:space:]]*\[[[:space:]]*"?output"?[[:space:]]*\.[[:space:]]*"?post_process"?[[:space:]]*\]'
+  val_re="^[[:space:]]*\"?command\"?[[:space:]]*=[[:space:]]*(\"([^\"]*)\"|$sq([^$sq]*)$sq)"
+  dot_re="^[[:space:]]*(\"?output\"?[[:space:]]*\.[[:space:]]*)?\"?post_process\"?[[:space:]]*\.[[:space:]]*\"?command\"?[[:space:]]*=[[:space:]]*(\"([^\"]*)\"|$sq([^$sq]*)$sq)"
+  while IFS= read -r line || [ -n "$line" ]; do
+    if [[ $line =~ ^[[:space:]]*\[ ]]; then
+      if [[ $line =~ $hdr_re ]]; then in_table=1; else in_table=0; fi
+      continue
+    fi
+    if [[ $line =~ $dot_re ]]; then
+      printf '%s\n' "${BASH_REMATCH[3]}${BASH_REMATCH[4]}"; return 0
+    fi
+    if [ "$in_table" -eq 1 ] && [[ $line =~ $val_re ]]; then
+      printf '%s\n' "${BASH_REMATCH[2]}${BASH_REMATCH[3]}"; return 0
+    fi
+  done < "$1"
+  return 0
+}
+
+# python3's tomllib (3.11+) is the only TOML parser we can plausibly expect to
+# be on the machine. When it is absent the check is skipped rather than
+# guessed; when it is present, a config this script just wrote and cannot parse
+# is put back the way it was instead of being left in place.
+HAVE_TOMLLIB=0
+if command -v python3 >/dev/null 2>&1 && python3 -c 'import tomllib' 2>/dev/null; then
+  HAVE_TOMLLIB=1
+fi
+toml_parses() {
+  [ "$HAVE_TOMLLIB" -eq 1 ] || return 0
+  python3 -c 'import sys, tomllib; tomllib.load(open(sys.argv[1], "rb"))' "$1" 2>/dev/null
+}
+
+# Rewrite the example's placeholder command line to the absolute path of the
+# wrapper. Done in bash on purpose: fed to sed, $WRAPPER would be a replacement
+# string, where '&', a backslash and the s/// delimiter are all metacharacters
+# -- a HOME containing one of them produced invalid TOML, a wrong path, or an
+# aborted run. Bash interpolation has no metacharacters, and the value is
+# escaped for TOML once, up top, where WRAPPER_TOML is defined.
+subst_wrapper_path() {
+  local cfgf="$1" tmp="$1.tmp.$$" line ph
+  ph='^[[:space:]]*command[[:space:]]*=[[:space:]]*.?/home/(SEU_USUARIO|YOUR_USERNAME|YOUR_USER)/\.local/bin/voxtype-punct'
+  while IFS= read -r line || [ -n "$line" ]; do
+    if [[ $line =~ $ph ]]; then
+      printf 'command = "%s"\n' "$WRAPPER_TOML"
+    else
+      printf '%s\n' "$line"
+    fi
+  done < "$cfgf" > "$tmp" || { rm -f -- "$tmp"; return 1; }
+  mv -- "$tmp" "$cfgf"
+}
+
+# Take back a config.toml this step created but could not make correct. The
+# machine is left as it was -- no config.toml at all, i.e. voxtype's own
+# defaults -- with the rejected file kept next to it for inspection.
+reject_new_cfg() {
+  if run mv -- "$cfg" "$cfg.rejected.$EPOCH"; then
+    note "the file this installer wrote was moved to $cfg.rejected.$EPOCH"
+  else
+    note "could not move it aside either -- $cfg is NOT usable as it stands"
+  fi
+  note "to do it by hand:"
+  note "  cp $SRC/config/config.toml.example $cfg"
+  note "  then set, inside [output.post_process]:  command = \"$WRAPPER_TOML\""
+}
+
+if [ ! -e "$cfg" ]; then
+  # Fresh install: copy the example and substitute the real path. Every
+  # placeholder spelling the example has ever used is handled, so renaming it
+  # in the repo cannot silently break this.
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf '          %s[dry-run]%s copy %s -> %s and set command = "%s"\n' \
+      "$C_SKIP" "$C_OFF" "$SRC/config/config.toml.example" "$cfg" "$WRAPPER"
+    ok "config.toml would be created from the example"
+  elif ! run install -D -m 644 -- "$SRC/config/config.toml.example" "$cfg"; then
+    fail "could not write $cfg -- no post-processing will run"
+    note "check the permissions on $VOX_CFG"
+  elif ! subst_wrapper_path "$cfg"; then
+    fail "could not set the wrapper path in $cfg"
+    reject_new_cfg
+  elif ! grep -qxF -- "command = \"$WRAPPER_TOML\"" "$cfg"; then
+    # Verified by reading the exact line back, not by grepping for the absence
+    # of the placeholder: this is the single most likely misconfiguration in
+    # the project and the one with the least visible symptom, so it must never
+    # pass silently. Fixed-string, whole-line: no pattern can match by luck.
+    fail "config.toml was created but its post_process command is not $WRAPPER"
+    note "expected the line:  command = \"$WRAPPER_TOML\""
+    reject_new_cfg
+  elif ! toml_parses "$cfg"; then
+    fail "config.toml was created but does not parse as TOML"
+    reject_new_cfg
+  else
+    ok "config.toml created from the example, post_process -> $WRAPPER"
+    if grep -qE 'SEU_USUARIO|YOUR_USERNAME|YOUR_USER' -- "$cfg"; then
+      note "the example still mentions a placeholder username elsewhere in the"
+      note "file (a comment, most likely); the post_process command is correct."
+    fi
+    # The example is written for the author's NVIDIA machine. These two keys
+    # are CUDA-only and a wrong value here is not a subtle degradation: the
+    # model can fail to load at all.
+    if grep -qE '^[[:space:]]*(flash_attention|gpu_isolation)[[:space:]]*=[[:space:]]*true' -- "$cfg"; then
+      warn "the example enables flash_attention and/or gpu_isolation -- CUDA only"
+      note "on AMD, Intel or CPU-only machines set BOTH to false in $cfg,"
+      note "otherwise voxtype may fail to load the model."
+      note "  grep -n 'flash_attention\\|gpu_isolation' $cfg"
+    fi
+  fi
+elif has_pp "$cfg" && [ -n "$(pp_command_value "$cfg")" ]; then
+  existing="$(pp_command_value "$cfg")"
+  skip "config.toml already has a post_process command -- not modified"
+  note "current: command = \"$existing\""
+  if [ "$existing" != "$WRAPPER" ] && [ "$existing" != "$WRAPPER_TOML" ]; then
+    case "$existing" in
+      /*)
+        if [ -x "$existing" ]; then
+          warn "it points somewhere other than the wrapper this installer manages"
+        else
+          # The silent-fallback trap, caught.
+          fail "that path is NOT an executable file -- voxtype is silently"
+          note "falling back to the raw transcript on every dictation."
+          note "fix with:  command = \"$WRAPPER_TOML\""
+        fi
+        ;;
+      *) warn "that is not an absolute path; voxtype does not expand ~ or \$HOME" ;;
+    esac
+  fi
+elif has_pp "$cfg"; then
+  # The table is there but no command key was recognised -- which may mean
+  # there is none, or merely that it is written in a form this script does not
+  # read (an inline table, a multi-line string). Either way: instructions only,
+  # and worded so that following them cannot create a duplicate table or a
+  # duplicate key, both of which make the config unparseable.
+  warn "config.toml declares post_process but no command key I could recognise -- not modified"
+  note "look at what is actually there first:"
+  note "  grep -n 'post_process' -A4 $cfg"
+  note "if a command is already set, nothing needs doing. If there is none, add"
+  note "it INSIDE the existing table -- do not add a second [output.post_process]"
+  note "header and do not add a second command key:"
+  note "  command = \"$WRAPPER_TOML\""
+  note "  timeout_ms = 35000"
+else
+  # No such table anywhere: appending one at the end is valid TOML and additive.
+  # Backed up first regardless, because this is still an edit to a live config,
+  # and verified afterwards, because "the installer said OK" must not be how a
+  # user finds out their config no longer parses.
+  if ! toml_parses "$cfg"; then
+    # Appending to a file that is already broken would end with this script
+    # restoring a backup and blaming itself for damage it did not do.
+    warn "config.toml does not parse as TOML as it stands -- not modified"
+    note "fix the syntax error first, then re-run this installer. To see it:"
+    note "  python3 -c 'import sys,tomllib;tomllib.load(open(sys.argv[1],\"rb\"))' $cfg"
+  elif ! run cp -p -- "$cfg" "$cfg.bak.$EPOCH"; then
+    fail "could not back up $cfg -- not modified"
+    note "add this at the end of the file by hand:"
+    note "  [output.post_process]"
+    note "  command = \"$WRAPPER_TOML\""
+    note "  timeout_ms = 35000"
+  elif [ "$DRY_RUN" -eq 1 ]; then
+    printf '          %s[dry-run]%s append [output.post_process] stanza to %s\n' \
+      "$C_SKIP" "$C_OFF" "$cfg"
+    ok "[output.post_process] would be appended to config.toml"
+  elif ! printf '%s\n' "$STANZA" >> "$cfg"; then
+    fail "could not append to $cfg -- not modified"
+  elif ! toml_parses "$cfg"; then
+    # Almost certainly a post_process table declared in a spelling has_pp
+    # missed, now duplicated. voxtype would refuse the whole config.
+    if run cp -p -- "$cfg.bak.$EPOCH" "$cfg"; then
+      fail "appending [output.post_process] made $cfg unparseable -- restored"
+      note "your original config.toml is back exactly as it was."
+    else
+      fail "appending [output.post_process] made $cfg unparseable AND the restore failed"
+      note "the good copy is $cfg.bak.$EPOCH -- put it back before dictating."
+    fi
+    note "it looks like the file already configures post_process in a form this"
+    note "installer does not recognise. Set the command there by hand:"
+    note "  command = \"$WRAPPER_TOML\""
+  else
+    ok "appended [output.post_process] to config.toml (backup: $cfg.bak.$EPOCH)"
+  fi
+fi
+
+# ==========================================================================
+step "7/8  Bar plugin -> $PLUGIN_LINK"
+# A symlink, not a copy, so 'git pull' in this repo updates the plugin. Omarchy
+# supports symlinked third-party plugins.
+# ==========================================================================
+if [ -L "$PLUGIN_LINK" ]; then
+  target="$(readlink -f -- "$PLUGIN_LINK" 2>/dev/null || true)"
+  if [ "$target" = "$SRC" ]; then
+    skip "already symlinked to this repo"
+  else
+    # Repointing someone's plugin link at a different checkout without asking
+    # is the kind of surprise that makes an installer untrustworthy.
+    fail "$PLUGIN_LINK is a symlink to a DIFFERENT path"
+    note "it points at: ${target:-<broken link>}"
+    note "if that is stale, remove it and re-run:"
+    note "  rm '$PLUGIN_LINK' && '$SRC/install'"
+  fi
+elif [ -d "$PLUGIN_LINK" ]; then
+  # A real directory here is almost certainly the user's own live copy of the
+  # plugin -- the thing this repo was extracted from. Deleting it would destroy
+  # local edits that exist nowhere else.
+  fail "$PLUGIN_LINK is a real directory, not a symlink -- refusing to touch it"
+  note "that is probably your existing live plugin. back it up and relink:"
+  note "  mv '$PLUGIN_LINK' '$PLUGIN_LINK.bak.$EPOCH'"
+  note "  ln -s '$SRC' '$PLUGIN_LINK'"
+  note "then compare and delete the backup once you are happy."
+elif [ -e "$PLUGIN_LINK" ]; then
+  fail "$PLUGIN_LINK exists and is neither a symlink nor a directory -- refusing to touch it"
+elif ! run mkdir -p -- "$PLUGIN_DIR"; then
+  fail "could not create $PLUGIN_DIR -- bar plugin not linked"
+elif run ln -s -- "$SRC" "$PLUGIN_LINK"; then
+  ok "$(would symlinked) $PLUGIN_LINK -> $SRC"
+else
+  fail "could not create the symlink $PLUGIN_LINK"
+  note "link it by hand:  ln -s '$SRC' '$PLUGIN_LINK'"
+fi
+
+# ==========================================================================
+step "8/8  Remaining manual steps (nothing below is executed)"
+# Each of these either needs a decision (a cloud API key), touches a file this
+# installer must not write (shell.json, bindings.lua), or restarts a service.
+# ==========================================================================
+cat <<EOF
+
+  1. Enable the bar plugin. This edits ~/.config/omarchy/shell.json, which the
+     installer will not do -- a bad edit there breaks the whole bar.
+
+       omarchy plugin validate "$PLUGIN_LINK"
+       omarchy plugin enable local.voxtype
+
+  2. Local LLM stage (optional -- needed for the 'qwen' stage).
+
+       sudo systemctl enable --now ollama
+       ollama pull qwen2.5:7b
+       ollama create vp-qwen7 -f "$SRC/config/vp-qwen.Modelfile"
+
+     On a card with less than ~10 GB VRAM, edit the Modelfile to
+     'FROM qwen2.5:3b' first -- vp-qwen7 occupies about 6.6 GB, and if
+     OLLAMA_KEEP_ALIVE=-1 is set it stays resident permanently.
+
+  3. Cloud stage (optional -- needed for the 'gemini' stage).
+
+     !! This sends the full text of every dictation to Google. Skip it if that
+     !! is not acceptable to you. The installer never creates or reads this file.
+
+       install -m 600 /dev/null "$VOX_CFG/gemini.key"
+       printf '%s' 'YOUR_AI_STUDIO_KEY' > "$VOX_CFG/gemini.key"
+
+     Get a key at aistudio.google.com (Get API key). Then switch the pipeline
+     on yourself, e.g.:  echo 'sed+qwen+?gemini' > "$VOX_CFG/polish-mode"
+
+  4. History window hotkey. Add to ~/.config/hypr/bindings.lua:
+
+       o.bind("SUPER + SHIFT + V", "Dictation history", "omarchy-shell voxtype-history toggle")
+
+     Push-to-talk (hold F9) and Super+Ctrl+X already ship with Omarchy; there is
+     nothing to add for those.
+
+  5. Optional NVIDIA multi-GPU drop-in (only if you use the Whisper/Vulkan lane):
+
+       mkdir -p ~/.config/systemd/user/voxtype.service.d
+       cp "$SRC/config/systemd/gpu.conf" ~/.config/systemd/user/voxtype.service.d/
+
+  6. Restart the daemon so it picks up config.toml, and verify:
+
+       systemctl --user daemon-reload
+       systemctl --user restart voxtype
+       voxtype setup check
+       printf 'hello world' | "$WRAPPER"
+
+     That last command prints "hello world" UNCHANGED with the pipeline this
+     installer sets up ('sed', with no rules file). Unchanged output IS the
+     success case here -- the sed stage is a deliberate pass-through until you
+     give it rules, and an LLM stage is something you opt into (see step 2 and
+     step 3 above). To see which stages actually ran:
+
+       printf 'hello world' | VOX_TRACE=1 "$WRAPPER"
+
+     That prints the pipeline and every stage's decision on stderr. If it
+     prints nothing at all, the wrapper is not the file voxtype is calling.
+
+  7. The dictation log -- turn it off if you do not want one.
+
+     Every dictation, raw AND polished, is appended to
+     $HIST_FILE
+     (mode 0600, never leaves the machine, pruned automatically). This is the
+     symmetric opt-out to the cloud opt-in in step 3:
+
+       mkdir -p ~/.config/systemd/user/voxtype.service.d
+       printf '[Service]\nEnvironment=VOX_NO_HISTORY=1\n' \\
+         > ~/.config/systemd/user/voxtype.service.d/no-history.conf
+       systemctl --user daemon-reload && systemctl --user restart voxtype
+
+     Note that the bar plugin's history window reads that same file, so with
+     the log off the window stays empty. To clear the log without disabling it:
+     rm $HIST_FILE
+
+EOF
+
+# ==========================================================================
+printf '%s==> Summary%s\n' "$C_HEAD" "$C_OFF"
+printf '    %sOK%s %d   %sSKIP%s %d   %sWARN%s %d   %sNEED%s %d   %sFAIL%s %d\n' \
+  "$C_OK" "$C_OFF" "$OK_N" "$C_SKIP" "$C_OFF" "$SKIP_N" \
+  "$C_WARN" "$C_OFF" "$WARN_N" "$C_FAIL" "$C_OFF" "$MISSING_N" \
+  "$C_FAIL" "$C_OFF" "$FAIL_N"
+
+# Privacy is stated at the end too, because it is the part a user is most
+# likely to have scrolled past and the part they most need to have read.
+cat <<EOF
+
+    Privacy, in two lines:
+      * every dictation (raw AND polished) is appended to
+        $HIST_FILE
+        Set VOX_NO_HISTORY=1 to turn that off -- manual step 7 above shows how
+        to do it for the voxtype daemon.
+      * a pipeline containing 'gemini' sends that text to Google. The default
+        pipeline installed here ('sed') is entirely offline.
+
+EOF
+
+if [ "$MISSING_N" -gt 0 ]; then
+  printf '%s%d prerequisite(s) still missing -- read the NEED lines above.%s\n' \
+    "$C_WARN" "$MISSING_N" "$C_OFF"
+  printf 'That is a package to install, not an installer failure; the exit code is unaffected.\n'
+fi
+if [ "$FAIL_N" -gt 0 ]; then
+  printf '%sSome steps failed -- read the FAIL lines above.%s\n' "$C_FAIL" "$C_OFF"
+  exit 1
+fi
+[ "$DRY_RUN" -eq 1 ] && printf '%sDry run complete. Nothing was changed.%s\n' "$C_WARN" "$C_OFF"
+exit 0

@@ -1,0 +1,42 @@
+{
+  "schemaVersion": 1,
+  "id": "local.voxtype",
+  "name": "Voxtype",
+  "version": "1.0.0",
+  "author": "Guilherme Yamakawa de Oliveira",
+  "license": "MIT",
+  "description": "Show and edit the voxtype dictation polish pipeline from a native bar panel: an ordered list of sed, local-LLM and cloud stages, each of which can be marked as a fallback that only runs when the step above it fails. Includes a dictation-history window.",
+  "kinds": ["bar-widget"],
+  "entryPoints": { "barWidget": "Panel.qml" },
+  "barWidget": {
+    "displayName": "Voxtype",
+    "description": "Shows the active polish pipeline in the bar; click for a native editor that reorders, adds, removes and toggles fallback on stages, and opens the dictation history.",
+    "category": "System",
+    "allowMultiple": false,
+    "defaults": {
+      "modePath": "",
+      "colorize": true,
+      "modeColors": {}
+    },
+    "schema": [
+      {
+        "key": "modePath",
+        "type": "string",
+        "label": "Mode file (blank = ~/.config/voxtype/polish-mode)",
+        "defaultValue": ""
+      },
+      {
+        "key": "colorize",
+        "type": "boolean",
+        "label": "Tint the bar icon per mode",
+        "defaultValue": true
+      },
+      {
+        "key": "modeColors",
+        "type": "object",
+        "label": "Per-mode icon colors, e.g. {\"off\":\"#a55555\"}",
+        "defaultValue": {}
+      }
+    ]
+  }
+}

@@ -1,0 +1,398 @@
+#!/bin/bash
+# Pós-processo do voxtype — pipeline de estágios ligáveis independentemente.
+#
+# O modo é uma SPEC: estágios separados por '+', na ORDEM DE EXECUÇÃO, com
+# repetição permitida. Cada token é [?]<estágio>:
+#
+#   sed     -> correções determinísticas (offline, não pontua). Nunca falha.
+#   qwen    -> o SEU endpoint de LLM. Default: ollama nesta máquina; pode ser
+#              outra máquina ou uma API paga (ver <config>/voxtype/llm.conf).
+#              Alias legado: 3090
+#   gemini  -> Gemini na nuvem.
+#
+# O prefixo '?' significa FALLBACK DO PASSO ANTERIOR: o passo só roda se o passo
+# imediatamente acima FALHOU. Sem '?' o passo roda sempre, em cima da saída do
+# anterior — "sed+qwen+gemini" são DOIS passes de LLM encadeados, e isso é opção
+# legítima do usuário, não bug.
+#
+# Exemplos:
+#   sed+qwen+?gemini+sed   nuvem só se o qwen não responder, depois sed de novo
+#   sed+qwen+gemini        qwen e DEPOIS gemini por cima (dois passes)
+#   sed+gemini+?qwen       nuvem primeiro, local de reserva
+#
+# Os 5 nomes antigos continuam valendo como apelido:
+#   off=<nada>  local=sed  3090=sed+qwen  gemini=sed+gemini  auto=sed+qwen+?gemini
+#
+# Modo vem de $VOX_MODE (para testes) ou de <config>/voxtype/polish-mode, onde
+# <config> é $XDG_CONFIG_HOME (ou ~/.config quando não estiver setado) — a mesma
+# resolução que o próprio voxtype e o instalador usam. Hardcodar ~/.config fazia
+# o instalador gravar num lugar e o wrapper ler de outro.
+# Fallback em qualquer falha = melhor texto até ali (nunca string vazia).
+CFG="${XDG_CONFIG_HOME:-$HOME/.config}/voxtype"
+# AUTO_SPEC é o apelido "auto": nuvem de reserva, mas só quando o usuário pede.
+# DEFAULT_SPEC é o que roda quando o polish-mode some, vem vazio ou vem quebrado
+# — e por isso NÃO pode ter estágio de nuvem. Uma escrita truncada do painel ou
+# um erro de digitação não pode virar "manda todo o ditado pro Google" sem
+# ninguém escolher isso. Continua não sendo "cru", que perderia a pontuação.
+AUTO_SPEC="sed+qwen+?gemini"
+DEFAULT_SPEC="sed+qwen"
+MODE="${VOX_MODE:-$(cat "$CFG/polish-mode" 2>/dev/null)}"
+# polish-mode vazio/com espaço/em CAIXA ALTA/com lixo degradava em silêncio.
+MODE="${MODE%%$'\n'*}"; MODE="${MODE//[[:space:]]/}"; MODE="${MODE,,}"
+
+# Apelido é a STRING INTEIRA, não um token: "3090" sozinho é sed+qwen, mas
+# "sed+3090" tem 3090 como alias de qwen. Arquivo vazio/ilegível = default,
+# nunca "cru" — perder a pontuação em silêncio é pior que o contrário.
+explicit_off=0
+case "$MODE" in
+  off)    SPEC=""; explicit_off=1 ;;
+  local)  SPEC="sed" ;;
+  3090)   SPEC="sed+qwen" ;;
+  gemini) SPEC="sed+gemini" ;;
+  auto)   SPEC="$AUTO_SPEC" ;;
+  "")     SPEC="$DEFAULT_SPEC" ;;
+  *)      SPEC="$MODE" ;;
+esac
+
+# A spec vira uma LISTA ORDENADA de passos. Cada passo é guardado como o nome do
+# estágio, com '?' na frente quando é fallback do passo anterior.
+PIPE=(); spec_ok=1
+if [ -n "$SPEC" ]; then
+  IFS='+' read -ra _stages <<<"$SPEC"
+  for _s in "${_stages[@]}"; do
+    [ -z "$_s" ] && continue   # "+gemini" = spec explícita, não o apelido
+    _fb=""
+    case "$_s" in
+      \?*) _fb="?"; _s="${_s#\?}" ;;
+    esac
+    # '?' no PRIMEIRO passo é sem sentido: não existe passo acima pra ter
+    # falhado. Descarta o '?' em vez de rejeitar a spec inteira.
+    [ "${#PIPE[@]}" -eq 0 ] && _fb=""
+    case "$_s" in
+      sed)       PIPE+=("${_fb}sed") ;;
+      qwen|3090) PIPE+=("${_fb}qwen") ;;
+      gemini)    PIPE+=("${_fb}gemini") ;;
+      *)         spec_ok=0 ;;   # inclui "?" sozinho (estágio vazio)
+    esac
+  done
+fi
+# Spec inválida cai no default — nunca em "cru", que perderia a pontuação sem o
+# usuário perceber. Só "off" desliga, e desliga EXPLICITAMENTE.
+if [ "$spec_ok" -eq 0 ] || { [ "${#PIPE[@]}" -eq 0 ] && [ "$explicit_off" -eq 0 ]; }; then
+  IFS='+' read -ra PIPE <<<"$DEFAULT_SPEC"
+fi
+KEY_FILE="$CFG/gemini.key"; PROMPT_FILE="$CFG/polish-prompt.txt"
+
+# ── ENDPOINT DO ESTÁGIO `qwen` ───────────────────────────────────────────────
+# O estágio `qwen` NÃO significa "ollama nesta máquina". Significa "o SEU
+# endpoint de LLM", que pode perfeitamente estar em outro computador — é o caso
+# de quem não tem GPU e aponta pro servidor de um amigo, ou pra uma API paga.
+#
+# Por que um ARQUIVO e não variável de ambiente: o wrapper é spawnado pelo
+# daemon do voxtype (systemd --user), então `export OLLAMA_URL=...` no shell do
+# usuário NUNCA chega aqui. Sem este arquivo o endereço só era mudável editando
+# este script, que é exatamente o que o `omarchy plugin update` sobrescreve.
+#
+# Formato: KEY=valor, um por linha, '#' comenta. Lido linha a linha e com lista
+# branca de chaves — NUNCA com `source`, porque isso transformaria um arquivo de
+# configuração em script executável rodando a cada ditado.
+LLM_CONF="${VOX_LLM_CONF:-$CFG/llm.conf}"
+_c_url=""; _c_api=""; _c_model=""; _c_keyfile=""; _c_timeout=""; _c_connect=""; _c_sys=""
+if [ -r "$LLM_CONF" ]; then
+  while IFS= read -r _line || [ -n "$_line" ]; do
+    _line="${_line%$'\r'}"
+    case "$_line" in ''|'#'*|';'*) continue ;; esac
+    case "$_line" in *=*) ;; *) continue ;; esac      # linha sem '=' é lixo, pula
+    _k="${_line%%=*}"; _v="${_line#*=}"
+    _k="${_k//[[:space:]]/}"
+    _v="${_v#"${_v%%[![:space:]]*}"}"; _v="${_v%"${_v##*[![:space:]]}"}"
+    case "$_v" in                                     # aspas em volta são opcionais
+      \"*\") _v="${_v#\"}"; _v="${_v%\"}" ;;
+      \'*\') _v="${_v#\'}"; _v="${_v%\'}" ;;
+    esac
+    case "$_k" in
+      LLM_URL)             _c_url="$_v" ;;
+      LLM_API)             _c_api="$_v" ;;
+      LLM_MODEL)           _c_model="$_v" ;;
+      LLM_KEY_FILE)        _c_keyfile="$_v" ;;
+      LLM_TIMEOUT)         _c_timeout="$_v" ;;
+      LLM_CONNECT_TIMEOUT) _c_connect="$_v" ;;
+      LLM_SEND_SYSTEM)     _c_sys="$_v" ;;
+      GEMINI_MODEL)        GEMINI_MODEL="${GEMINI_MODEL:-$_v}" ;;
+    esac
+  done < "$LLM_CONF"
+fi
+
+# Precedência: ambiente > llm.conf > default. OLLAMA_URL/OLLAMA_MODEL continuam
+# valendo como nomes legados, pra não quebrar quem já os usava em teste.
+LLM_URL="${VOX_LLM_URL:-${OLLAMA_URL:-${_c_url:-http://localhost:11434/api/generate}}}"
+LLM_MODEL="${VOX_LLM_MODEL:-${OLLAMA_MODEL:-${_c_model:-vp-qwen7}}}"
+LLM_KEY_FILE="${_c_keyfile:-$CFG/llm.key}"
+GEMINI_MODEL="${GEMINI_MODEL:-gemini-flash-latest}"
+
+# API deduzida do path da URL quando não declarada. Errar aqui não perde ditado
+# (a resposta simplesmente não parseia e o estágio conta como falha), mas erra
+# em silêncio, então vale deduzir bem.
+LLM_API="${VOX_LLM_API:-$_c_api}"
+if [ -z "$LLM_API" ]; then
+  case "$LLM_URL" in
+    */api/generate*)      LLM_API="ollama" ;;
+    */api/chat*)          LLM_API="ollama-chat" ;;
+    */chat/completions*)  LLM_API="openai" ;;
+    *)                    LLM_API="ollama" ;;
+  esac
+fi
+
+# connect-timeout de 1s era certo pra localhost e é errado pra qualquer outra
+# máquina: um servidor no fim de um túnel responde o handshake em mais de 1s com
+# frequência, e o estágio falhava sempre, em silêncio. Localhost mantém 1s.
+if [ -z "$_c_connect" ]; then
+  case "$LLM_URL" in
+    http://localhost*|http://127.0.0.1*|http://\[::1\]*) _c_connect=1 ;;
+    *) _c_connect=5 ;;
+  esac
+fi
+LLM_CONNECT_TIMEOUT="$_c_connect"
+LLM_TIMEOUT="${_c_timeout:-15}"
+
+# Mandar o system prompt é o default porque é o que faz um modelo QUALQUER
+# servir: sem ele, um qwen2.5 de prateleira RESPONDE ao ditado em vez de
+# pontuá-lo. Quem usa um modelo com o prompt já embutido (o vp-qwen7 deste repo)
+# pode pôr LLM_SEND_SYSTEM=0 e economizar os tokens do prompt a cada ditado.
+LLM_SEND_SYSTEM="${_c_sys:-1}"
+
+text=$(cat); [ -z "$text" ] && exit 0
+raw="$text"   # guardado pro histórico: é o que o Parakeet ouviu, antes do sed
+
+# ── HISTÓRICO ────────────────────────────────────────────────────────────────
+# O voxtype NÃO guarda histórico de ditado (só de meetings, em sqlite). Este
+# wrapper é o único ponto que vê todo texto ditado, então grava aqui.
+#
+# ⚠️ Isto registra TUDO que você dita. Arquivo 0600. VOX_NO_HISTORY=1 desliga.
+HIST="${VOX_HISTORY:-${XDG_STATE_HOME:-$HOME/.local/state}/voxtype/history.jsonl}"
+HIST_MAX_BYTES=${VOX_HISTORY_MAX_BYTES:-1048576}   # ~1 MB, depois poda
+HIST_KEEP=${VOX_HISTORY_KEEP:-500}                 # linhas mantidas na poda
+
+log_history() {
+  [ -n "${VOX_NO_HISTORY:-}" ] && return 0
+  mkdir -p "$(dirname "$HIST")" 2>/dev/null || return 0
+  # umask no subshell: criar e SÓ DEPOIS dar chmod deixava uma janela em que o
+  # arquivo existia 0644. Assim ele já nasce 0600. O chmod fica como rede pra
+  # arquivo antigo, criado antes desta correção.
+  [ -e "$HIST" ] || { (umask 077; : >"$HIST"); chmod 600 "$HIST" 2>/dev/null; }
+  # jq monta o JSON: texto ditado tem aspas, acento e quebra de linha, e
+  # concatenar string à mão produziria JSONL inválido que quebra o leitor.
+  jq -cn --arg t "$(date -Is)" --arg raw "$raw" --arg text "$1" --arg spec "$SPEC" \
+     '{t:$t,spec:$spec,raw:$raw,text:$text}' >>"$HIST" 2>/dev/null || return 0
+  # Poda por TAMANHO, não a cada ditado: `stat` é barato, reescrever não.
+  local sz; sz=$(stat -c%s "$HIST" 2>/dev/null || echo 0)
+  if [ "$sz" -gt "$HIST_MAX_BYTES" ]; then
+    # mesmo motivo do umask acima: o .tmp carrega os últimos 500 ditados e não
+    # pode existir 0644 nem por um instante.
+    (umask 077; tail -n "$HIST_KEEP" "$HIST" >"$HIST.tmp" 2>/dev/null) &&
+      chmod 600 "$HIST.tmp" 2>/dev/null && mv "$HIST.tmp" "$HIST" 2>/dev/null
+  fi
+  return 0
+}
+
+# Saída única: grava o histórico e entrega o texto. `|| true` em toda parte —
+# falha de histórico NUNCA pode custar o ditado.
+emit() { log_history "$1" || true; printf '%s' "$1"; exit 0; }
+
+# nenhum estágio = texto cru
+[ "${#PIPE[@]}" -eq 0 ] && emit "$text"
+
+# (D) correções determinísticas — sempre (menos off). As REGRAS NÃO SÃO MAIS
+# HARDCODED: vêm de um script sed externo, porque as regras que estavam aqui
+# eram correções de português (a pior, "and -> e", destruía ditado em inglês) e
+# este wrapper é distribuído pra qualquer idioma.
+#
+# Onde as regras são procuradas, nesta ordem:
+#   1. $VOX_SED_RULES  (caminho explícito, usado nos testes)
+#   2. $CFG/polish-sed.sed  (~/.config/voxtype/polish-sed.sed)
+#
+# Contrato do estágio — igual ao de antes, o sed NUNCA falha:
+#   - sem arquivo, arquivo vazio ou ilegível -> passa o texto DIRETO, sem tocar,
+#     e ainda conta como sucesso (last_ok=1). Default de fábrica é este no-op.
+#   - com arquivo -> `sed --sandbox -E -f`. Script sed malformado NÃO custa o
+#     ditado: o erro é detectado pelo status de saída e a entrada volta intacta.
+#   - regra que ESVAZIA o texto (`d`, `s/.*//`, ou qualquer coisa que sobre só
+#     espaço) também conta como falha, e a entrada volta intacta. Sem isso o
+#     `emit` imprimia string vazia e o ditado sumia — e pior, com "sed+qwen" o
+#     LLM era chamado com prompt vazio e a alucinação dele virava o ditado.
+#   - `--sandbox` desliga os comandos `e`, `r` e `w` do GNU sed. Sem ele um
+#     arquivo de regras é CÓDIGO: `s/x/y/e` executa shell e `s/x/y/w saida`
+#     grava o ditado em disco. Como o projeto convida a apontar o VOX_SED_RULES
+#     pra arquivo de terceiro, regra é dado, nunca programa.
+#   - só stdout do sed é aproveitado; stderr é descartado, e o VOX_TRACE diz
+#     qual dos caminhos rodou.
+#
+# Exemplos de regras prontas ficam no repo, em config/:
+#   polish-sed.example.sed  neutro, ponto de partida pra qualquer idioma
+#   polish-sed.pt-BR.sed    as regras antigas deste arquivo, pt-BR, opt-in
+# Instalar = copiar o escolhido pra ~/.config/voxtype/polish-sed.sed.
+run_sed() {
+  local _f _out
+  _f="${VOX_SED_RULES:-$CFG/polish-sed.sed}"
+  if [ ! -s "$_f" ]; then
+    _trace "  sed sem regras ($_f) — passa direto"
+    printf '%s' "$1"; return 0
+  fi
+  if ! _out=$(printf '%s' "$1" | sed --sandbox -E -f "$_f" 2>/dev/null); then
+    _trace "  sed regras inválidas ($_f) — text intacto"
+    printf '%s' "$1"; return 0
+  fi
+  if [ -z "${_out//[[:space:]]/}" ] && [ -n "${1//[[:space:]]/}" ]; then
+    _trace "  sed esvaziou o texto ($_f) — text intacto"
+    printf '%s' "$1"; return 0
+  fi
+  printf '%s' "$_out"
+  return 0
+}
+SYS=$(cat "$PROMPT_FILE" 2>/dev/null)
+
+# LLM_TIMEOUT (default 15s) = o mesmo teto do wrapper original que já estava em
+# produção. Um agente baixou pra 4s nesta sessão sem justificativa medida;
+# ditado longo estourava e a saída do LLM era descartada em silêncio. Não mexer
+# sem medir — e ver a conta do timeout_ms no config.toml antes de aumentar.
+#
+# Nem a chave nem o ditado podem aparecer em argv: /proc/<pid>/cmdline é legível
+# por qualquer processo local. O corpo vai pelo STDIN do curl (--data-binary @-)
+# e a chave vai num arquivo de headers (`-H @`, aqui um pipe anônimo).
+try_local() {
+  local body r hdr k
+  # jq monta o corpo: o ditado tem aspas, acento e quebra de linha, e concatenar
+  # string à mão produziria JSON inválido que o servidor recusa.
+  case "$LLM_API" in
+    openai)
+      if [ "$LLM_SEND_SYSTEM" != 0 ] && [ -n "$SYS" ]; then
+        body=$(jq -Rn --arg m "$LLM_MODEL" --arg s "$SYS" --arg t "$text" \
+          '{model:$m,messages:[{role:"system",content:$s},{role:"user",content:$t}],temperature:0.1,stream:false}')
+      else
+        body=$(jq -Rn --arg m "$LLM_MODEL" --arg t "$text" \
+          '{model:$m,messages:[{role:"user",content:$t}],temperature:0.1,stream:false}')
+      fi ;;
+    ollama-chat)
+      if [ "$LLM_SEND_SYSTEM" != 0 ] && [ -n "$SYS" ]; then
+        body=$(jq -Rn --arg m "$LLM_MODEL" --arg s "$SYS" --arg t "$text" \
+          '{model:$m,messages:[{role:"system",content:$s},{role:"user",content:$t}],stream:false,options:{temperature:0.1}}')
+      else
+        body=$(jq -Rn --arg m "$LLM_MODEL" --arg t "$text" \
+          '{model:$m,messages:[{role:"user",content:$t}],stream:false,options:{temperature:0.1}}')
+      fi ;;
+    *)
+      if [ "$LLM_SEND_SYSTEM" != 0 ] && [ -n "$SYS" ]; then
+        body=$(jq -Rn --arg m "$LLM_MODEL" --arg s "$SYS" --arg p "$text" \
+          '{model:$m,system:$s,prompt:$p,stream:false,options:{temperature:0.1}}')
+      else
+        body=$(jq -Rn --arg m "$LLM_MODEL" --arg p "$text" \
+          '{model:$m,prompt:$p,stream:false,options:{temperature:0.1}}')
+      fi ;;
+  esac
+
+  # Chave só quando existe: ollama na LAN não pede nenhuma, API paga pede.
+  # Só a PRIMEIRA linha, pra um arquivo torto não virar header injetado.
+  k=$(cat "$LLM_KEY_FILE" 2>/dev/null); k="${k%%$'\n'*}"
+  if [ -n "$k" ]; then
+    r=$(printf '%s' "$body" | curl -s --connect-timeout "$LLM_CONNECT_TIMEOUT" \
+      --max-time "$LLM_TIMEOUT" \
+      -H @<(printf 'Authorization: Bearer %s\nContent-Type: application/json\n' "$k") \
+      -X POST --data-binary @- "$LLM_URL" 2>/dev/null)
+  else
+    r=$(printf '%s' "$body" | curl -s --connect-timeout "$LLM_CONNECT_TIMEOUT" \
+      --max-time "$LLM_TIMEOUT" \
+      -H @<(printf 'Content-Type: application/json\n') \
+      -X POST --data-binary @- "$LLM_URL" 2>/dev/null)
+  fi
+
+  # Cada API guarda o texto num lugar. `// empty` em todas: resposta de erro tem
+  # o campo ausente, e o chamador trata ausência como falha e preserva o texto.
+  case "$LLM_API" in
+    openai)      printf '%s' "$r" | jq -r '.choices[0].message.content // empty' 2>/dev/null ;;
+    ollama-chat) printf '%s' "$r" | jq -r '.message.content // empty' 2>/dev/null ;;
+    *)           printf '%s' "$r" | jq -r '.response // empty' 2>/dev/null ;;
+  esac
+}
+
+# medido nesta máquina: 4.1s a 10.1s em ditado realista -> 15s.
+# Retry é CONDICIONAL: só quando o curl NÃO estourou timeout (rc 28). O retry
+# existe para o erro "caller does not have permission", que volta rápido.
+try_gemini() {
+  # Só a PRIMEIRA linha da chave: arquivo com mais de uma linha viraria mais de
+  # um header no `-H @` abaixo, e um arquivo de chave torto não pode virar
+  # header injetado.
+  local k; k=$(cat "$KEY_FILE" 2>/dev/null); k="${k%%$'\n'*}"; [ -z "$k" ] && return
+  # sem system prompt o Gemini RESPONDE ao ditado em vez de pontuá-lo. Abortar.
+  [ -z "$SYS" ] && return
+  local body; body=$(jq -Rn --arg s "$SYS" --arg t "$text" \
+    '{system_instruction:{parts:[{text:$s}]},contents:[{parts:[{text:$t}]}],generationConfig:{temperature:0.1}}')
+  local url="https://generativelanguage.googleapis.com/v1beta/models/$GEMINI_MODEL:generateContent"
+  local raw rc r t0 elapsed
+  t0=$SECONDS
+  # Nem a chave nem o ditado podem aparecer em argv: /proc/<pid>/cmdline é
+  # legível por qualquer processo local, então guardar a chave em arquivo 0600 e
+  # depois passá-la em `-H` na linha de comando não protegia nada. A chave vai
+  # num arquivo de headers (`-H @arquivo`, aqui um pipe anônimo que só existe
+  # dentro deste processo) e o corpo vai pelo stdin (--data-binary @-).
+  # `-H @arquivo` precisa de curl >= 7.55; o Omarchy tem 8.x.
+  raw=$(printf '%s' "$body" | curl -s --max-time 15 \
+    -H @<(printf 'x-goog-api-key: %s\nContent-Type: application/json\n' "$k") \
+    -X POST --data-binary @- "$url" 2>/dev/null); rc=$?
+  elapsed=$((SECONDS - t0))
+  r=$(printf '%s' "$raw" | jq -r '.candidates[0].content.parts[0].text // empty' 2>/dev/null)
+  # Só repete quando a 1a tentativa falhou RÁPIDO (erro transitório de API volta
+  # em <3s). Uma falha lenta repetida estourava o timeout_ms do voxtype, que
+  # descarta TODO o pós-processo e digita o transcript cru do Parakeet.
+  if [ -z "$r" ] && [ "$rc" -ne 28 ] && [ "$elapsed" -lt 3 ]; then
+    raw=$(printf '%s' "$body" | curl -s --max-time 15 \
+      -H @<(printf 'x-goog-api-key: %s\nContent-Type: application/json\n' "$k") \
+      -X POST --data-binary @- "$url" 2>/dev/null)
+    r=$(printf '%s' "$raw" | jq -r '.candidates[0].content.parts[0].text // empty' 2>/dev/null)
+  fi
+  printf '%s' "$r"
+}
+
+# Executa a pipeline na ordem da spec. `text` sempre guarda o melhor resultado
+# até aqui, então perder o ditado é estruturalmente impossível: um estágio que
+# falha simplesmente não substitui nada.
+#
+# `last_ok` é o estado do passo IMEDIATAMENTE ANTERIOR — não "algum LLM já deu
+# certo". É isso que faz o '?' ser fallback POR PASSO: em "sed+qwen+?gemini" o
+# gemini olha só pro qwen. Um passo de fallback pulado NÃO mexe em last_ok, pra
+# que "qwen+?gemini+?sed" ainda encadeie os reservas na ordem certa.
+#
+# VOX_TRACE=1 imprime o que rodou/pulou em STDERR (stdout continua só o texto).
+_trace() { [ -n "$VOX_TRACE" ] && printf '%s\n' "$*" >&2; return 0; }
+_trace "PIPE=${PIPE[*]}"
+last_ok=1   # nada acima pra ter falhado
+for _st in "${PIPE[@]}"; do
+  _fb=0
+  case "$_st" in \?*) _fb=1; _st="${_st#\?}" ;; esac
+  if [ "$_fb" -eq 1 ] && [ "$last_ok" -eq 1 ]; then _trace "skip  ?$_st (last_ok=1)"; continue; fi
+  _trace "run   $_st"
+  case "$_st" in
+    sed)
+      text=$(run_sed "$text"); last_ok=1 ;;   # sed nunca falha
+    qwen|gemini)
+      if [ "$_st" = qwen ]; then r=$(try_local); else r=$(try_gemini); fi
+      # resposta só com espaço/TAB/newline não substitui nada (perda silenciosa)
+      r_probe="${r//[[:space:]]/}"
+      # PISO DE TAMANHO. Sem isto o LLM RESUME ditado longo e o wrapper aceita:
+      # medido 2760 bytes -> 143 bytes (95% do texto perdido, sem nenhum aviso).
+      # Polir pontuação não encurta — só cresce. Abaixo de 60% do que entrou é
+      # resumo/truncagem, não polimento: trata como falha e preserva o texto.
+      # 60% e não 90% pra não rejeitar saída legítima quando o sed do passo
+      # anterior tiver expandido abreviação.
+      _in_len=${#text}; _out_len=${#r}
+      _too_short=0
+      [ "$_in_len" -gt 0 ] && [ $(( _out_len * 100 / _in_len )) -lt 60 ] && _too_short=1
+      if [ -n "$r_probe" ] && [ "$r_probe" != "null" ] && [ "$_too_short" -eq 0 ]; then
+        text="$r"; last_ok=1; _trace "  ok  $_st"
+      elif [ "$_too_short" -eq 1 ] && [ -n "$r_probe" ]; then
+        last_ok=0; _trace "  FAIL $_st (truncou: ${_out_len}B de ${_in_len}B — text intacto)"
+      else
+        last_ok=0; _trace "  FAIL $_st (text intacto)"   # text INTACTO
+      fi ;;
+  esac
+done
+emit "$text"

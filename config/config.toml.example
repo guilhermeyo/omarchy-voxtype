@@ -1,0 +1,182 @@
+# Voxtype Configuration
+#
+# Location: ~/.config/voxtype/config.toml
+# All settings can be overridden via CLI flags
+#
+# State file for external integrations (Waybar, polybar, etc.)
+# Use "auto" for default location ($XDG_RUNTIME_DIR/voxtype/state),
+# a custom path, or "disabled" to turn off. The daemon writes state
+# ("idle", "recording", "transcribing") to this file whenever it changes.
+# Required for `voxtype record toggle` and `voxtype status` commands.
+state_file = "auto"
+engine = "parakeet"
+
+[hotkey]
+# Hotkey is configured in Hyprland. Default is Super + Ctrl + X
+enabled = false
+key = "HOME"
+mode = "push_to_talk"
+
+[audio]
+# Audio input device ("default" uses system default)
+# List devices with: pactl list sources short
+device = "default"
+
+# Sample rate in Hz (whisper expects 16000)
+sample_rate = 16000
+
+# Maximum recording duration in seconds (safety limit)
+max_duration_secs = 60
+
+# Pause MPRIS media players during recording
+pause_media = true
+
+# [audio.feedback]
+# Enable audio feedback sounds (beeps when recording starts/stops)
+# enabled = true
+#
+# Sound theme: "default", "subtle", "mechanical", or path to custom theme directory
+# theme = "default"
+#
+# Volume level (0.0 to 1.0)
+# volume = 0.7
+
+[whisper]
+# Model to use for transcription
+# Options: tiny, tiny.en, base, base.en, small, small.en, medium, medium.en, large-v3, large-v3-turbo
+# .en models are English-only but faster and more accurate for English
+# large-v3-turbo is faster than large-v3 with minimal accuracy loss (recommended for GPU)
+# Or provide absolute path to a custom .bin model file
+model = "large-v3-turbo"
+
+# Language for transcription
+# Use "en" for English, "auto" for auto-detection
+# See: https://github.com/openai/whisper#available-models-and-languages
+language = "auto"
+
+# Translate non-English speech to English
+translate = false
+mode = "local"
+flash_attention = true
+on_demand_loading = false
+gpu_isolation = true
+
+# Number of CPU threads for inference (omit for auto-detection)
+# threads = 4
+
+[output]
+# Primary output mode: "type" or "clipboard"
+# - type: Simulates keyboard input at cursor position (requires ydotool)
+# - clipboard: Copies text to clipboard (requires wl-copy)
+# paste: copies to the clipboard and sends ONE keystroke, instead of typing
+# character by character. The "type" mode used wtype at 1 ms per character;
+# with fcitx5 active every synthetic keystroke goes through the input engine,
+# and the race scrambled the text (cursor jumping back to the start, characters
+# landing in the middle of what was already being written). Paste sidesteps
+# that entire path: one clipboard write and one keystroke.
+mode = "paste"
+
+# shift+insert, not ctrl+v, because terminals do not paste with ctrl+v. Ghostty
+# only binds shift+insert and ctrl+shift+v (see `ghostty +list-keybinds`); a
+# ctrl+v passes through the terminal and reaches the app underneath, and in
+# Claude Code ctrl+v is the PASTE IMAGE shortcut - with text on the clipboard it
+# simply does nothing. shift+insert also pastes in GTK, Chromium and Electron,
+# so it is the single key that works in every app, which is what this option
+# has to be.
+paste_keys = "shift+insert"
+
+# Puts the previous clipboard contents back after pasting - otherwise every
+# dictation destroys whatever you had copied. The delay has to cover the
+# receiving app reading the clipboard; apps that read it through a subprocess
+# are slow and miss a shorter window.
+restore_clipboard = true
+restore_clipboard_delay_ms = 600
+
+# Fall back to clipboard if typing fails
+fallback_to_clipboard = true
+
+# Delay between typed characters in milliseconds
+# 0 = fastest possible, increase if characters are dropped
+type_delay_ms = 1
+auto_submit = false
+shift_enter_newlines = false
+pre_type_delay_ms = 0
+
+# Post-processing command (optional)
+# Pipe transcribed text through an external command for cleanup before output.
+# The command receives text on stdin and outputs processed text on stdout.
+# Useful for LLM-based text cleanup, grammar correction, filler word removal.
+# On any failure (timeout, error), falls back to original transcription.
+#
+# [output.post_process]
+# command = "ollama run llama3.2:1b 'Clean up this dictation. Fix grammar, remove filler words. Output only the cleaned text:'"
+# timeout_ms = 30000  # 30 second timeout (generous for LLM)
+
+[output.notification]
+# Show notification when recording starts (hotkey pressed)
+on_recording_start = false
+
+# Show notification when recording stops (transcription beginning)
+on_recording_stop = false
+
+# Show notification with transcribed text after transcription completes
+on_transcription = false
+show_engine_icon = false
+
+[text]
+spoken_punctuation = false
+smart_auto_submit = false
+
+[meeting]
+enabled = false
+
+[meeting.diarization]
+enabled = false
+
+[meeting.audio]
+source = "mic"
+
+[osd]
+enabled = true
+frontend = "gtk4"
+position = "bottom-center"
+width_px = 400
+height_px = 48
+margin_px = 24
+top_margin = 0.85
+opacity = 0.95
+waveform_window_secs = 3.0
+peak_decay_db_per_sec = 6.0
+waveform_gain = 10.0
+
+[status]
+icon_theme = "emoji"
+
+# [text]
+# Text processing options (word replacements, spoken punctuation)
+#
+# Enable spoken punctuation conversion (e.g., say "period" to get ".")
+# spoken_punctuation = false
+#
+# Custom word replacements (case-insensitive)
+# replacements = { "hyperwhisper" = "hyprwhspr" }
+
+[parakeet]
+model = "parakeet-tdt-0.6b-v3"
+
+[output.post_process]
+# Absolute path required - voxtype expands neither ~ nor $HOME here, and on ANY
+# failure it falls back SILENTLY to the raw transcript, so a wrong path produces
+# no error at all, just unpolished dictation.
+# Editing by hand: put your own username in the path below (see: whoami).
+# The `install` script rewrites this line for you with the resolved path.
+command = "/home/YOUR_USERNAME/.local/bin/voxtype-punct"
+# Worst case for the default "sed+qwen+?gemini" spec, taken from the real
+# timeouts in bin/voxtype-punct: 15s for a qwen step (--connect-timeout 1
+# --max-time 15) plus up to 18s for a gemini step (--max-time 15, plus one
+# conditional retry that only fires after a *fast* failure), = ~33s, plus a
+# second or two of spawn and jq margin. That is what 35000 covers.
+# Exceeding this timeout DISCARDS the whole post-process (the sed stage
+# included) and types the raw transcript, so raise it on slower hardware or for
+# a longer spec - lowering it only loses polish.
+timeout_ms = 35000

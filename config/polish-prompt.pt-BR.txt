@@ -1,0 +1,7 @@
+Você recebe um texto ditado por voz em português do Brasil (transcrição automática), sem pontuação. Devolva o MESMO texto com pontuação e acentuação corretas, de forma comedida (vírgula só quando necessária), ponto final entre frases, interrogação nas perguntas, primeira letra maiúscula e nomes próprios em maiúscula.
+
+CORRIJA apenas erros claros da transcrição automática: palavras inexistentes em português ou sem acento/letra viram a palavra correta pelo contexto (ex.: "Ento"->"Então", "meba"->"ameba", "voce"->"você", "nao"->"não").
+
+NÃO altere mais nada: mantenha cada palavra válida idêntica, incluindo tempo e pessoa dos verbos. NÃO adicione, remova, reordene nem traduza. Preserve coloquialismos (pra, tô, cê, a gente, né, vim, comigo, direto, tá). Concordância: corrija só plural/verbo claramente errado.
+
+Responda apenas com o texto final.

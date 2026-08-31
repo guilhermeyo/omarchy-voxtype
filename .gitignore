@@ -1,0 +1,98 @@
+# .gitignore for omarchy-voxtype
+#
+# This repo is a dictation tool. The files it works next to on a real machine are
+# a live API key and a verbatim record of everything the user has ever said out
+# loud. Installing or testing this project necessarily moves files between the
+# repo, ~/.config/voxtype/ and ~/.local/state/voxtype/, and that is exactly the
+# motion that drags those files into the working tree. Every group below names
+# the leak it prevents. Do not relax a rule to "just commit this one".
+
+# ── Credentials ─────────────────────────────────────────────────────────────
+# The `gemini` pipeline stage reads a Google Generative Language API key from
+# ~/.config/voxtype/gemini.key (mode 0600). It is never part of this repo and
+# there is no example of it — the README tells you to create it by hand.
+gemini.key
+*.key
+*.pem
+*.p12
+.env
+.env.*
+!.env.example
+
+# ── Dictation content: everything the user has ever said ────────────────────
+# bin/voxtype-punct appends one JSON object per dictation — raw ASR text AND
+# polished text — to ~/.local/state/voxtype/history.jsonl. History.qml reads it.
+# A single copy into the repo would publish the user's entire spoken history.
+history.jsonl
+*.jsonl
+
+# voxtype's meeting mode keeps its transcript index in
+# ~/.local/share/voxtype/meetings/index.db. Same content class, SQLite instead.
+meetings/
+index.db
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# ── Live machine state, not shippable config ────────────────────────────────
+# The real config.toml carries an absolute /home/<username> path to the wrapper
+# and hardware-specific tuning; ship config/config.toml.example instead.
+config.toml
+config/config.toml
+# The current pipeline spec, written by the bar panel. Personal, not a default.
+polish-mode
+# The user's own installed copies of the opt-in examples.
+polish-sed.sed
+config/polish-sed.sed
+polish-prompt.local.txt
+config/polish-prompt.local.txt
+
+# ── Backup churn ────────────────────────────────────────────────────────────
+# voxtype and the panel both write timestamped backups next to the file they
+# edit (config.toml.bak.pastekeys.1786717159, polish-mode.bak.1785264160, ...).
+# Those backups contain the same secrets and state as the originals.
+*.bak
+*.bak.*
+*.bak-*
+*.orig
+*.rej
+*~
+
+# ── Audio and models: never in git ──────────────────────────────────────────
+# The batch-transcribe helper in bin/ converts its input to a 16 kHz mono WAV.
+# Recorded audio is dictation content with the voice still attached to it.
+*.wav
+*.mp3
+*.m4a
+*.ogg
+*.opus
+*.flac
+*.webm
+
+# ASR and LLM weights live in ~/.local/share/voxtype/models and /var/lib/ollama.
+# They are large, redistributable only under their own licences, and never ours.
+models/
+*.bin
+*.onnx
+*.gguf
+*.safetensors
+*.pt
+
+# ── Scratch and internal notes ──────────────────────────────────────────────
+# docs/ is where session notes go in the sibling plugin repos. Untracked there,
+# untracked here — internal notes are not plugin documentation.
+docs/
+*.tmp
+*.log
+/tmp/
+
+# ── Editor and OS noise ─────────────────────────────────────────────────────
+.DS_Store
+._*
+Thumbs.db
+*.swp
+*.swo
+.idea/
+.vscode/

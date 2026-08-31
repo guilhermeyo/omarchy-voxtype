@@ -1,0 +1,63 @@
+# ~/.config/voxtype/llm.conf — where the `qwen` pipeline stage sends your text.
+#
+# Copy this file to ~/.config/voxtype/llm.conf and edit it. Without it the stage
+# talks to a local ollama on http://localhost:11434, which is only useful if you
+# are actually running one.
+#
+# WHY A FILE AND NOT AN ENVIRONMENT VARIABLE: voxtype-punct is spawned by the
+# voxtype daemon under systemd --user, so an `export` in your shell never
+# reaches it. This file is the only place the endpoint can be set that survives
+# a plugin update.
+#
+# Format: KEY=value, one per line, '#' starts a comment, quotes around the value
+# are optional. The file is PARSED, never sourced — it cannot run commands.
+
+# ── The endpoint ────────────────────────────────────────────────────────────
+# Any HTTP endpoint you can reach. It does NOT have to be this machine: point it
+# at a box on your LAN, at the other end of a VPN, or at a paid API.
+#
+#   ollama, same machine        http://localhost:11434/api/generate
+#   ollama, another machine     http://192.168.1.50:11434/api/generate
+#   anything OpenAI-compatible  https://api.example.com/v1/chat/completions
+#
+# For a remote ollama the SERVER must listen on more than loopback — on the
+# server, set OLLAMA_HOST=0.0.0.0:11434 in its systemd unit. Plain ollama has no
+# authentication, so only do that on a network you trust, or put it behind a VPN.
+LLM_URL = http://localhost:11434/api/generate
+
+# The model name as the endpoint knows it.
+LLM_MODEL = qwen2.5:7b
+
+# ── Optional ────────────────────────────────────────────────────────────────
+# API shape. Left unset it is deduced from the URL path, which is right almost
+# always: /api/generate -> ollama, /api/chat -> ollama-chat, /chat/completions
+# -> openai. Set it explicitly if your endpoint uses a nonstandard path.
+# LLM_API = openai
+
+# Bearer token for endpoints that need one. Point at a file, not the token
+# itself — the token never belongs in a config file you might share.
+# Create it with: install -m 600 /dev/null ~/.config/voxtype/llm.key
+# LLM_KEY_FILE = ~/.config/voxtype/llm.key
+
+# Send the punctuation prompt (polish-prompt.txt) with every request. Default 1.
+#
+# KEEP THIS ON unless your model already has the prompt baked in. A stock model
+# with no system prompt does not punctuate your dictation — it CONVERSES with
+# it, and you get the model's reply pasted into your editor. The only reason to
+# turn it off is a model built from config/vp-qwen.Modelfile, which carries the
+# same prompt internally.
+# LLM_SEND_SYSTEM = 1
+
+# Seconds to wait for the whole response. Default 15.
+# Raising this above ~20 also means raising `timeout_ms` under
+# [output.post_process] in config.toml — when that outer timeout blows, voxtype
+# throws away the entire post-process and types the raw transcript instead.
+# LLM_TIMEOUT = 15
+
+# Seconds to wait for the TCP connection. Defaults to 1 for localhost and 5 for
+# anything else. Raise it if your endpoint is at the end of a slow tunnel.
+# LLM_CONNECT_TIMEOUT = 5
+
+# Model for the separate `gemini` stage (that stage has its own key file,
+# ~/.config/voxtype/gemini.key, and always talks to Google).
+# GEMINI_MODEL = gemini-flash-latest

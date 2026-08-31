@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# Convert any audio file to 16 kHz mono WAV, transcribe it with voxtype
+# (Parakeet), then polish it with voxtype-punct — the same pipeline
+# push-to-talk uses. Optional helper; nothing else in this project needs it.
+#
+# Extra dependencies beyond the wrapper's: ffmpeg, python3, and a voxtype build
+# that has the `transcribe` subcommand.
+#
+# voxtype transcribe often abort()s after printing the text (CUDA unload
+# while the daemon also holds the GPU). Treat stdout as success if we got text.
+set -euo pipefail
+IN="${1:?input file}"
+WAV="$(mktemp --suffix=.wav)"
+RAWF="$(mktemp)"
+trap 'rm -f "$WAV" "$RAWF"' EXIT
+
+ffmpeg -nostdin -hide_banner -loglevel error -y -i "$IN" -ac 1 -ar 16000 -c:a pcm_s16le "$WAV"
+
+set +e
+voxtype -q transcribe "$WAV" >"$RAWF" 2>/dev/null || true
+set -e
+
+RAW="$(
+  python3 - "$RAWF" <<'PY'
+import sys, re
+from pathlib import Path
+text = Path(sys.argv[1]).read_text(errors="replace")
+# strip ansi
+text = re.sub(r"\x1b\[[0-9;]*m", "", text)
+skip = re.compile(
+    r"^(Loading audio|Audio format|Processing \d|WARNING|WARN|INFO|error:|"
+    r"Detected CUDA|Configuring CUDA|Parakeet|Memcpy|Some nodes|"
+    r"\d{4}-\d{2}-\d{2}T)",
+    re.I,
+)
+lines = [ln.strip() for ln in text.splitlines() if ln.strip() and not skip.search(ln)]
+print(lines[-1] if lines else "", end="")
+PY
+)"
+
+if [[ -z "${RAW// }" ]]; then
+  echo "${0##*/}: empty transcript" >&2
+  exit 1
+fi
+
+# Prefer whatever voxtype-punct is on PATH; fall back to the install location.
+PUNCT="${VOX_PUNCT:-$(command -v voxtype-punct || true)}"
+[[ -n "$PUNCT" ]] || PUNCT="$HOME/.local/bin/voxtype-punct"
+if [[ ! -x "$PUNCT" ]]; then
+  echo "${0##*/}: voxtype-punct not found (set VOX_PUNCT to its path)" >&2
+  exit 1
+fi
+
+# Batch transcription is not push-to-talk: it must not land in the dictation
+# history the bar panel shows.
+printf '%s' "$RAW" | VOX_NO_HISTORY=1 "$PUNCT"
+printf '\n'
